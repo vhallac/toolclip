@@ -201,24 +201,26 @@ export default function toolclip(api: ExtensionAPI): void {
 		const toolclipInstructions =
 			"\n## Tool Result Replacement\n" +
 			"When a long tool result has a [tool-result-pending-replacement: ...] marker, " +
-			"you MUST call `replace_tool_result(toolCallId, replacement)` as soon as you " +
-			"have derived the relevant information from that single tool call.\n" +
-			"- Respond to every marker: as soon as you can extract the information you need " +
-			"  from ONE tool result, replace it with the distilled result. The larger the " +
-			"  original, the more context you save — so large results are the priority, not " +
-			"  a reason to defer.\n" +
-			"- Replace with only what you will need later: key numbers, error codes, paths, " +
-			"  decisions, or state summaries. Keep your replacement tight and complete enough " +
-			"  to answer future questions that depend on this result.\n" +
+			"you MUST call `replace_tool_result(toolCallId, replacement)` once you have " +
+			"extracted what you need from that result — before you make the next tool call or " +
+			"write your final answer.\n" +
+			"- Replacement is a completion step of extraction, not optional cleanup. The trigger " +
+			"  is simple: once you have captured the relevant information from a marked result " +
+			"  into your reasoning or into your replacement, that result is spent — replace it now.\n" +
+			"- The larger the original, the more context you save, so large results are the " +
+			"  priority. Do not let size become a reason to keep the full original around.\n" +
+			"- Capture what you need: key numbers, error codes, paths, decisions, or state " +
+			"  summaries — enough to answer future questions that depend on this result. Then " +
+			"  replace the full output with that distilled summary.\n" +
 			"- Drop verbose output such as file contents, full directory listings, or exhaustive " +
-			"  search results once you have extracted the relevant parts.\n" +
-			"- Do NOT defer replacement hoping to use the full original later. Unless you are " +
-			"  about to reference a specific obscure detail in the very next turn, replace it now.\n" +
+			"  search results as soon as you have extracted the relevant parts.\n" +
+			"- Do NOT keep a result because you might quote it later. If you will reference a " +
+			"  specific excerpt, put that excerpt into the replacement now and replace the " +
+			"  whole result — do not park the full original for later quoting.\n" +
 			"- The replacement must be strictly shorter than the original and within the " +
 			"  configured ratio.\n" +
-			"- If you genuinely cannot yet read the full result, or it contains a critical detail " +
-			"  you need in the immediate next step, you may keep it for one more turn — but " +
-			"  replace it before moving on.\n";
+			"- The only valid reason to keep a marked result un-replaced is that you have not " +
+			"  yet read it. Once you have read it, replace it before moving on.\n";
 
 		return {
 			systemPrompt: event.systemPrompt + toolclipInstructions,

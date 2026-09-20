@@ -397,13 +397,13 @@ describe("before_agent_start handler", () => {
 		// Key directives of the sharpened prompt are present.
 		expect(result.systemPrompt).toContain("## Tool Result Replacement");
 		expect(result.systemPrompt).toContain(
-			"you MUST call `replace_tool_result(toolCallId, replacement)` as soon as you",
+			"you MUST call `replace_tool_result(toolCallId, replacement)` once you have",
 		);
 		expect(result.systemPrompt).toContain(
-			"from ONE tool result, replace it with the distilled result",
+			"Replacement is a completion step of extraction, not optional cleanup",
 		);
 		expect(result.systemPrompt).toContain(
-			"large results are the priority",
+			"Do not let size become a reason to keep the full original around",
 		);
 		expect(result.systemPrompt).toContain(
 			"The replacement must be strictly shorter than the original",
@@ -430,7 +430,7 @@ describe("before_agent_start handler", () => {
 		expect(result.systemPrompt).toContain("## Tool Result Replacement");
 		expect(result.systemPrompt).toContain("replace_tool_result");
 		expect(result.systemPrompt).toContain(
-			"you MUST call `replace_tool_result(toolCallId, replacement)` as soon as you",
+			"you MUST call `replace_tool_result(toolCallId, replacement)` once you have",
 		);
 	});
 
