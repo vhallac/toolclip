@@ -784,3 +784,87 @@ describe("before_agent_start handler", () => {
 		expect(result).toBeUndefined();
 	});
 });
+// -----------------------------------------------------------------------
+// calibration (context snapshot + message_end) tests
+// -----------------------------------------------------------------------
+describe("divisor calibration", () => {
+	it("recalibrates the divisor from message_end usage and changes later markers", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+
+		// 1. A `context` event with 4000 chars of message content snapshots
+		//    the character count for the prompt pi is about to send.
+		const contextEvent = {
+			type: "context",
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "y".repeat(4000) }] },
+			],
+		};
+		invokeHandler(handlers, "context", contextEvent);
+
+		// 2. The model reports 2000 actual input tokens for that prompt → the
+		//    true chars-per-token is 2, not the default 4. First sample has
+		//    alpha = 1, so the divisor jumps to 2.
+		invokeHandler(handlers, "message_end", {
+			type: "message_end",
+			message: { role: "assistant", usage: { input: 2000 } },
+		});
+
+		// 3. A fresh tool result of 4000 chars is now estimated with the
+		//    calibrated divisor 2 → ceil(4000/2) = 2000 tokens in its marker,
+		//    not the 1000 the default divisor would have produced.
+		const result = invokeHandler(handlers, "tool_result", {
+			type: "tool_result",
+			toolCallId: "bash-cal",
+			toolName: "bash",
+			content: [{ type: "text", text: "x".repeat(4000) }],
+			isError: false,
+		});
+
+		expect(result).toBeDefined();
+		const content = (result as { content: Array<{ type: string; text: string }> }).content;
+		expect(content[1].text).toMatch(
+			/^\[tool-result-pending-replacement: toolCallId=bash-cal, tokens=2000\]$/,
+		);
+	});
+
+	it("does not calibrate when TOOLCLIP_CALIBRATE=false (marker stays at default divisor)", () => {
+		const { handlers, pi } = createMockApi();
+		const prev = process.env.TOOLCLIP_CALIBRATE;
+		process.env.TOOLCLIP_CALIBRATE = "false";
+		try {
+			toolclip(pi as never);
+
+			// Snapshot + message_end would normally move the divisor.
+			invokeHandler(handlers, "context", {
+				type: "context",
+				messages: [{ role: "user", content: "y".repeat(4000) }],
+			});
+			invokeHandler(handlers, "message_end", {
+				type: "message_end",
+				message: { role: "assistant", usage: { input: 2000 } },
+			});
+
+			// 4010 chars still estimated with divisor 4 → 1003 tokens (and above
+			// the 1000 threshold, so a marker is emitted). Without calibration the
+			// divisor stays pinned at the default.
+			const result = invokeHandler(handlers, "tool_result", {
+				type: "tool_result",
+				toolCallId: "bash-cal2",
+				toolName: "bash",
+				content: [{ type: "text", text: "x".repeat(4010) }],
+				isError: false,
+			});
+			const content = (result as { content: Array<{ type: string; text: string }> }).content;
+			expect(content[1].text).toMatch(
+				/^\[tool-result-pending-replacement: toolCallId=bash-cal2, tokens=1003\]$/,
+			);
+		} finally {
+			if (prev === undefined) {
+				delete process.env.TOOLCLIP_CALIBRATE;
+			} else {
+				process.env.TOOLCLIP_CALIBRATE = prev;
+			}
+		}
+	});
+});

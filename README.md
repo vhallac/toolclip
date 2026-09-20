@@ -32,17 +32,12 @@ The LLM is the only actor. There is no auto-summarizer and no auto-eviction. The
 | `TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS` | `1000` | Minimum estimated token count for a tool result to get a pending marker. Results at or below the threshold are left untouched. |
 | `TOOLCLIP_STEERING_REMINDER` | `true` | Inject a single trailing steering reminder per round when marked results stay un-replaced for several turns. |
 | `TOOLCLIP_STEERING_REMINDER_TURN` | `3` | Minimum tool-result-bearing turns while a pending marker exists before the reminder is eligible. |
+| `TOOLCLIP_CALIBRATE` | `true` | Calibrate the token-estimator divisor against the model's real token counts each turn (ephemeral, per session). |
+| `TOOLCLIP_CALIBRATOR_INITIAL_DIVISOR` | `4` | Starting chars-per-token divisor (and the fixed divisor when calibration is disabled). |
 
-The max-replacement-ratio gate is intentionally **not** reintroduced: `replace_tool_result` accepts a replacement of any size and records a `grew` flag when a replacement is at least as large as its original — the observation target for reintroducing a length gate later. Token estimation uses `Math.ceil(text.length / 4)` (chars/4 heuristic, same as sesclip).
+The max-replacement-ratio gate is intentionally **not** reintroduced: `replace_tool_result` accepts a replacement of any size and records a `grew` flag when a replacement is at least as large as its original — the observation target for reintroducing a length gate later.
 
-The steering reminder is configurable:
-
-| Env var | Default | Meaning |
-|---|---|---|
-| `TOOLCLIP_STEERING_REMINDER` | `true` | Whether to inject the once-per-round steering reminder when marked results stay un-replaced. |
-| `TOOLCLIP_STEERING_REMINDER_TURN` | `3` | Minimum number of tool-result-bearing turns (with an un-replaced marker present) before the reminder becomes eligible. The reminder fires at most once per round. |
-
-Token estimation uses `Math.ceil(text.length / 4)` (chars/4 heuristic).
+**Token estimation & calibration.** Token counts use the chars/N heuristic (`Math.ceil(length / divisor)`), starting at chars/4 (same as sesclip). When calibration is enabled, the divisor is tuned to the active model over the session: each turn, the character count of the full context is compared against the model's reported `usage.input`, and the observed chars-per-token ratio is blended into the divisor via an exponential moving average. Calibration is ephemeral — it does not persist across sessions (persistence is a deferred improvement). Exactly the same divisor drives the pending-marker token counts and the replacement estimates, so markers stay consistent with what the model actually spends.
 
 ## Why this is separate from sesclip
 
@@ -51,7 +46,7 @@ Sesclip compacts the **entire** session context when it crosses a threshold. Too
 ## Out of scope (deferred)
 
 - Retrieval tools (`get_tool_result`, `grep_tool_result`, pagination).
-- Real tokenizer dependency (chars/4 is good enough for token estimates).
+- Real tokenizer dependency (chars/N is good enough; the divisor is calibrated to the active model instead).
 - Auto-summarization at `tool_result` time (would lose fidelity — the LLM must see the original first).
 - Size gates on replacements (removed for observation; reintroduce once we see `grew: true` in real runs).
 

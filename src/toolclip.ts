@@ -36,12 +36,21 @@ import type {
 	AgentToolResult,
 	ExtensionContext,
 	AgentToolUpdateCallback,
+	MessageEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
 import { loadToolclipConfig } from "../lib/toolclip-config.ts";
 import { createRuntimeState } from "../lib/runtime-state.ts";
-import { estimateTokens } from "../lib/tokens.ts";
+import {
+	estimateTokens,
+	estimateMessagesTokens,
+	countMessagesChars,
+	createCalibrator,
+	setSnapshotChars,
+	observeTokens,
+	getDivisor,
+} from "../lib/tokens.ts";
 import { buildPendingMarker, buildReplacedMarker } from "../lib/marker.ts";
 import {
 	createSteeringState,
@@ -66,11 +75,14 @@ import type { ToolclipRuntimeState } from "../lib/types.ts";
  * to the token estimate. Image blocks contribute their description text
  * (if any) plus a fixed overhead representing the base64 data.
  */
-function estimateToolResultTokens(content: ToolResultEvent["content"]): number {
+function estimateToolResultTokens(
+	content: ToolResultEvent["content"],
+	divisor: number,
+): number {
 	let total = 0;
 	for (const block of content) {
 		if (block.type === "text") {
-			total += estimateTokens(block.text);
+			total += estimateTokens(block.text, divisor);
 		}
 	}
 	return total;
@@ -103,6 +115,13 @@ export default function toolclip(api: ExtensionAPI): void {
 	const config = loadToolclipConfig();
 	const state: ToolclipRuntimeState = createRuntimeState();
 	const steering = createSteeringState();
+	const calibrator = createCalibrator(config.calibratorInitialDivisor);
+
+	// Read the current calibrated divisor. When calibration is disabled the
+	// divisor is fixed at the configured initial value.
+	function divisor(): number {
+		return config.calibrate ? getDivisor(calibrator) : config.calibratorInitialDivisor;
+	}
 
 	// -----------------------------------------------------------------------
 	// 1. tool_result event handler
@@ -119,7 +138,7 @@ export default function toolclip(api: ExtensionAPI): void {
 			return;
 		}
 
-		const tokens = estimateToolResultTokens(event.content);
+		const tokens = estimateToolResultTokens(event.content, divisor());
 		// Size gate: only results strictly above the configured token threshold
 		// get a pending marker. Smaller results are too cheap to distill —
 		// marking them wastes a toolCallId and steering budget. Empty results
@@ -173,7 +192,7 @@ export default function toolclip(api: ExtensionAPI): void {
 				reason: "unknown id",
 			};
 		}
-		const replacementTokens = estimateTokens(pair.replacement);
+		const replacementTokens = estimateTokens(pair.replacement, divisor());
 		// No size gate: accept any replacement. Record a `grew` flag when the
 		// replacement is at least as large as the original — the observation
 		// target. If we see `grew: true` in real runs, that is the signal to
@@ -341,6 +360,16 @@ export default function toolclip(api: ExtensionAPI): void {
 	//    (original prompt + all prior messages) is never modified.
 	// -----------------------------------------------------------------------
 	api.on("context", (event: ContextEvent) => {
+		// Calibration: snapshot the character count of the (unmodified)
+		// message array. This corresponds to the prompt that the immediately
+		// following LLM call will see; `message_end` pairs it with the model's
+		// actual `usage.input` for that call. We count the ORIGINAL messages,
+		// not the `modified` array, so the snapshot is the true pre-swap input
+		// pi sends. (The swap and steering append happen after this snapshot.)
+		if (config.calibrate) {
+			setSnapshotChars(calibrator, countMessagesChars(event.messages));
+		}
+
 		const modified = event.messages.map((msg) => {
 			if (msg.role !== "toolResult") {
 				return msg;
@@ -376,5 +405,29 @@ export default function toolclip(api: ExtensionAPI): void {
 		}
 
 		return { messages: modified };
+	});
+
+	// -----------------------------------------------------------------------
+	// 5. message_end event handler — calibrate the token-estimator divisor.
+	//
+	//    Each assistant message carries the model's actual `usage.input` for
+	//    the prompt that produced it. We already snapped that prompt's
+	//    character count in the preceding `context` handler, so here we blend
+	//    the observed chars-per-token ratio into the running divisor (EMA).
+	//    Only assistant messages have `usage`; user/toolResult messages are
+	//    ignored. Degenerate samples (zero/non-finite chars or tokens) are
+	//    skipped by `observeTokens`.
+	// -----------------------------------------------------------------------
+	api.on("message_end", (event: MessageEndEvent) => {
+		const usage = (event.message as { usage?: { input?: unknown } }).usage;
+		const input = usage?.input;
+		if (typeof input !== "number" || config.calibrate === false) {
+			return;
+		}
+		const snapshotChars = calibrator.latestChars;
+		if (snapshotChars === null) {
+			return;
+		}
+		observeTokens(calibrator, snapshotChars, input);
 	});
 }
