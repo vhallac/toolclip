@@ -12,15 +12,24 @@ export type ToolReg = {
 	execute: (toolCallId: string, params: unknown) => unknown;
 };
 
+/** One recorded `sendUserMessage` call (a pi-native steer). */
+export interface SteeredMessage {
+	content: string | Array<{ type: string; text?: string }>;
+	options: { deliverAs?: string; expandPromptTemplates?: boolean } | undefined;
+}
+
 export interface MockApi {
 	handlers: Map<string, Handler[]>;
 	tools: Map<string, ToolReg>;
 	pi: Record<string, unknown>;
+	/** sendUserMessage calls recorded by the mock, in call order. */
+	steers: SteeredMessage[];
 }
 
 export function createMockApi(): MockApi {
 	const handlers = new Map<string, Handler[]>();
 	const tools = new Map<string, ToolReg>();
+	const steers: SteeredMessage[] = [];
 	const pi = {
 		on(eventName: string, handler: Handler) {
 			handlers.set(eventName, [...(handlers.get(eventName) ?? []), handler]);
@@ -28,8 +37,17 @@ export function createMockApi(): MockApi {
 		registerTool(tool: ToolReg) {
 			tools.set(tool.name, tool);
 		},
+		// Pi-native steering: mirror the real fire-and-forget contract — the
+		// extension API's sendUserMessage queues the message and never throws
+		// to the caller (errors are surfaced internally).
+		sendUserMessage(
+			content: string | Array<{ type: string; text?: string }>,
+			options?: { deliverAs?: string; expandPromptTemplates?: boolean },
+		) {
+			steers.push({ content, options });
+		},
 	};
-	return { handlers, tools, pi };
+	return { handlers, tools, pi, steers };
 }
 
 /**

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import toolclip from "../src/toolclip.ts";
 import { createMockApi, invokeHandler, invokeTool } from "./_helpers/mock-pi.ts";
-import type { Handler } from "./_helpers/mock-pi.ts";
+import type { Handler, SteeredMessage } from "./_helpers/mock-pi.ts";
 
 // -----------------------------------------------------------------------
 // tool_result event handler tests
@@ -689,9 +689,9 @@ describe("context event handler", () => {
 	});
 });
 // -----------------------------------------------------------------------
-// steering reminder tests (context handler)
+// steering reminder tests (turn_end → pi-native steer via sendUserMessage)
 // -----------------------------------------------------------------------
-describe("steering reminder injection", () => {
+describe("steering reminder delivery", () => {
 	const LONG = "x".repeat(9000); // 5776 tokens estimated — above the 1000-token threshold
 
 	afterEach(() => {
@@ -709,96 +709,95 @@ describe("steering reminder injection", () => {
 		});
 	}
 
-	function runContext(
-		handlers: Map<string, Handler[]>,
-		ids: string[],
-	): { messages: Array<Record<string, unknown>> } {
-		return invokeHandler(handlers, "context", {
-			type: "context",
-			messages: ids.map((toolCallId) => ({
-				role: "toolResult",
-				toolCallId,
-				toolName: "bash",
-				content: [{ type: "text", text: LONG }],
-				isError: false,
-			})),
-		}) as { messages: Array<Record<string, unknown>> };
+	// Helper: fire a turn_end — the steering observation point. At a real
+	// turn boundary pi polls the steering queue right after this event, so
+	// whatever the handler enqueues via sendUserMessage is delivered here.
+	function runTurnEnd(handlers: Map<string, Handler[]>, turnIndex = 0): void {
+		invokeHandler(handlers, "turn_end", {
+			type: "turn_end",
+			turnIndex,
+			message: { role: "assistant", content: [] },
+			toolResults: [],
+		});
 	}
 
-	function reminderText(result: { messages: Array<Record<string, unknown>> }): string {
-		const reminder = result.messages[result.messages.length - 1];
-		return ((reminder.content as Array<{ type: string; text: string }>)[0]).text;
+	// Helper: the single steered reminder's text.
+	function steeredText(steers: SteeredMessage[]): string {
+		expect(steers).toHaveLength(1);
+		expect(typeof steers[0].content).toBe("string");
+		return steers[0].content as string;
 	}
 
-	it("does not inject a reminder when there are no pending markers", () => {
-		const { handlers, pi } = createMockApi();
-		toolclip(pi as never);
-
-		// Fire several context events with no pending entries at all.
-		for (let i = 0; i < 5; i++) {
-			const result = invokeHandler(handlers, "context", {
-				type: "context",
-				messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
-			}) as { messages: Array<Record<string, unknown>> };
-			expect(result.messages).toHaveLength(1);
-			expect(result.messages[0].role).toBe("user");
-		}
-	});
-
-	it("fires on the size trigger for a single huge pending result (count = 1)", () => {
-		const { handlers, pi } = createMockApi();
+	it("delivers the reminder via pi-native steering (deliverAs: steer)", () => {
+		const { handlers, pi, steers } = createMockApi();
 		toolclip(pi as never);
 		emitPending(handlers, "huge-1");
 
 		// One pending of ~5776 estimated tokens exceeds the 5000 size
 		// threshold while the count (1) is nowhere near the count threshold:
 		// the golden-run single-huge-blob case the count trigger is blind to.
-		const r = runContext(handlers, ["huge-1"]);
-		expect(r.messages).toHaveLength(2);
-		expect(r.messages[1].role).toBe("user");
-		const text = reminderText(r);
+		runTurnEnd(handlers);
+		const text = steeredText(steers);
 		expect(text).toContain("1 tool-result-pending-replacements");
 		expect(text).toContain("totalling ~5776 estimated tokens");
 		expect(text).toContain("- huge-1 (~5776 tokens)");
 		expect(text).toContain("replace_tool_result");
 		expect(text).toContain("just in case");
-		expect(typeof r.messages[1].timestamp).toBe("number");
+		// Pi-native delivery: queued as a steer, so pi persists it as a real
+		// user message at the next turn boundary.
+		expect(steers[0].options).toEqual({ deliverAs: "steer" });
+	});
 
-		// Latched: no re-nag while the pile stays above the threshold.
-		const r2 = runContext(handlers, ["huge-1"]);
-		expect(r2.messages).toHaveLength(1);
+	it("latches: no re-send while the pile stays above the threshold", () => {
+		const { handlers, pi, steers } = createMockApi();
+		toolclip(pi as never);
+		emitPending(handlers, "huge-1");
+
+		runTurnEnd(handlers);
+		expect(steers).toHaveLength(1);
+
+		// The pile is unchanged and the latch is set: further turn boundaries
+		// must not repeat the nag — the persisted message is still in front
+		// of the model.
+		for (let i = 0; i < 5; i++) {
+			runTurnEnd(handlers, i + 1);
+		}
+		expect(steers).toHaveLength(1);
 	});
 
 	it("does not fire while the count is at or below the count threshold", () => {
 		// Raise the size threshold so the count trigger is isolated here.
 		vi.stubEnv("TOOLCLIP_STEERING_SIZE_THRESHOLD_TOKENS", "100000");
-		const { handlers, pi } = createMockApi();
+		const { handlers, pi, steers } = createMockApi();
 		toolclip(pi as never);
 		for (const id of ["t-1", "t-2", "t-3", "t-4", "t-5"]) {
 			emitPending(handlers, id);
 		}
 
 		// The count trigger fires strictly above 5: five pendings never
-		// cross it, however often the context event fires.
+		// cross it, however often the turn boundary is observed.
 		for (let i = 0; i < 3; i++) {
-			const r = runContext(handlers, ["t-1", "t-2", "t-3", "t-4", "t-5"]);
-			expect(r.messages).toHaveLength(5);
+			runTurnEnd(handlers, i);
 		}
+		expect(steers).toHaveLength(0);
 	});
 
-	it("count trigger fires once when the count exceeds the threshold, latched until it falls back", () => {
+	it("count trigger fires once when the count exceeds the threshold, latched while it grows", () => {
 		vi.stubEnv("TOOLCLIP_STEERING_SIZE_THRESHOLD_TOKENS", "100000");
-		const { handlers, pi } = createMockApi();
+		const { handlers, pi, steers } = createMockApi();
 		toolclip(pi as never);
 		const ids = ["t-1", "t-2", "t-3", "t-4", "t-5"];
 		for (const id of ids) emitPending(handlers, id);
 
+		// Five pendings: no fire.
+		runTurnEnd(handlers);
+		expect(steers).toHaveLength(0);
+
 		// The 6th pending crosses the count threshold.
 		emitPending(handlers, "t-6");
 		ids.push("t-6");
-		const r6 = runContext(handlers, ids);
-		expect(r6.messages).toHaveLength(ids.length + 1);
-		const text = reminderText(r6);
+		runTurnEnd(handlers);
+		const text = steeredText(steers);
 		expect(text).toContain("6 tool-result-pending-replacements");
 		for (const id of ids) {
 			expect(text).toContain(`- ${id} (~5776 tokens)`);
@@ -807,20 +806,19 @@ describe("steering reminder injection", () => {
 		// Grow the pile further: latched, no further reminders.
 		for (const id of ["t-7", "t-8", "t-9"]) {
 			emitPending(handlers, id);
-			ids.push(id);
-			const r = runContext(handlers, ids);
-			expect(r.messages).toHaveLength(ids.length);
+			runTurnEnd(handlers);
 		}
+		expect(steers).toHaveLength(1);
 	});
 
 	it("count trigger re-arms after the pile is replaced back down to the threshold", async () => {
 		vi.stubEnv("TOOLCLIP_STEERING_SIZE_THRESHOLD_TOKENS", "100000");
-		const { handlers, pi, tools } = createMockApi();
+		const { handlers, tools, pi, steers } = createMockApi();
 		toolclip(pi as never);
 		const ids = ["t-1", "t-2", "t-3", "t-4", "t-5", "t-6"];
 		for (const id of ids) emitPending(handlers, id);
-		const r6 = runContext(handlers, ids);
-		expect(r6.messages).toHaveLength(7); // fires at 6
+		runTurnEnd(handlers);
+		expect(steers).toHaveLength(1); // fires at 6
 
 		// Replace four of them: count drops to 2, the latch re-arms.
 		for (const id of ["t-1", "t-2", "t-3", "t-4"]) {
@@ -829,74 +827,71 @@ describe("steering reminder injection", () => {
 				replacement: "distilled",
 			});
 		}
-		const remaining = ids.filter((id) => !["t-1", "t-2", "t-3", "t-4"].includes(id));
-		const r2 = runContext(handlers, remaining);
-		expect(r2.messages).toHaveLength(2); // no reminder at count 2
+		runTurnEnd(handlers);
+		expect(steers).toHaveLength(1); // no reminder at count 2
 
 		// Re-grow the pile past the threshold: the reminder fires again.
 		for (const id of ["t-7", "t-8", "t-9", "t-10"]) {
 			emitPending(handlers, id);
-			remaining.push(id);
 		}
-		const rAgain = runContext(handlers, remaining);
-		expect(rAgain.messages).toHaveLength(remaining.length + 1);
-		const text = reminderText(rAgain);
+		runTurnEnd(handlers);
+		expect(steers).toHaveLength(2);
+		const text = steeredText(steers.slice(1));
 		expect(text).toContain("6 tool-result-pending-replacements");
 		expect(text).toContain("- t-10 (~5776 tokens)");
 		expect(text).not.toContain("- t-1\n");
 	});
 
 	it("fires a single reminder when both triggers fire on the same observation", () => {
-		const { handlers, pi } = createMockApi();
+		const { handlers, pi, steers } = createMockApi();
 		toolclip(pi as never);
 		const ids = ["t-1", "t-2", "t-3", "t-4", "t-5", "t-6"];
 		for (const id of ids) emitPending(handlers, id);
 
 		// 6 pendings x 5776 = 34,656 tokens: both the count (6 > 5) and the
 		// size (34,656 > 5000) triggers are true on the first observation —
-		// but only ONE reminder is appended.
-		const r = runContext(handlers, ids);
-		expect(r.messages).toHaveLength(ids.length + 1);
-		const text = reminderText(r);
+		// but only ONE reminder is steered.
+		runTurnEnd(handlers);
+		const text = steeredText(steers);
 		expect(text).toContain("6 tool-result-pending-replacements");
 		expect(text).toContain("totalling ~34656 estimated tokens");
 	});
 
 	it("size trigger re-arms only after the pile falls back to the size threshold", async () => {
-		const { handlers, pi, tools } = createMockApi();
+		const { handlers, tools, pi, steers } = createMockApi();
 		toolclip(pi as never);
 
 		// Two pendings: 11,552 total — size fires.
 		emitPending(handlers, "t-1");
 		emitPending(handlers, "t-2");
-		const r = runContext(handlers, ["t-1", "t-2"]);
-		expect(r.messages).toHaveLength(3);
+		runTurnEnd(handlers);
+		expect(steers).toHaveLength(1);
 
 		// Replace one: total 5776 is still above 5000 — the latch holds.
 		await invokeTool(tools, "replace_tool_result", "llm-1", {
 			toolCallId: "t-1",
 			replacement: "distilled",
 		});
-		const r2 = runContext(handlers, ["t-2"]);
-		expect(r2.messages).toHaveLength(1); // no reminder
+		runTurnEnd(handlers);
+		expect(steers).toHaveLength(1); // no reminder
 
 		// Replace the other: total falls to 0 — the latch re-arms.
 		await invokeTool(tools, "replace_tool_result", "llm-1", {
 			toolCallId: "t-2",
 			replacement: "distilled",
 		});
-		const r3 = runContext(handlers, []);
-		expect(r3.messages).toHaveLength(0);
+		runTurnEnd(handlers);
+		expect(steers).toHaveLength(1);
 
 		// A new huge pending fires again.
 		emitPending(handlers, "t-3");
-		const r4 = runContext(handlers, ["t-3"]);
-		expect(r4.messages).toHaveLength(2);
-		expect(reminderText(r4)).toContain("totalling ~5776 estimated tokens");
+		runTurnEnd(handlers);
+		expect(steers).toHaveLength(2);
+		expect(steeredText(steers.slice(1))).toContain("totalling ~5776 estimated tokens");
 	});
 
-	it("does not inject when all pending results have been replaced", async () => {
-		const { handlers, pi, tools } = createMockApi();
+	it("does not steer when all pending results have been replaced", async () => {
+		const { handlers, tools, pi, steers } = createMockApi();
 		toolclip(pi as never);
 		const ids = ["t-1", "t-2", "t-3", "t-4", "t-5"];
 		for (const id of ids) emitPending(handlers, id);
@@ -908,21 +903,20 @@ describe("steering reminder injection", () => {
 		}
 
 		for (let i = 0; i < 5; i++) {
-			const r = runContext(handlers, ids);
-			// Only the (swapped) tool results; no appended reminder.
-			expect(r.messages).toHaveLength(ids.length);
+			runTurnEnd(handlers, i);
 		}
+		expect(steers).toHaveLength(0);
 	});
 
-	it("re-announces a persistent pile on the first LLM call of the next round", () => {
-		const { handlers, pi } = createMockApi();
+	it("re-announces a persistent pile at the first turn boundary of the next round", () => {
+		const { handlers, pi, steers } = createMockApi();
 		toolclip(pi as never);
 		const ids = ["t-1", "t-2", "t-3", "t-4", "t-5"];
 		for (const id of ids) emitPending(handlers, id);
 
 		// Fire the reminder in round 1.
-		const r1 = runContext(handlers, ids);
-		expect(r1.messages).toHaveLength(6);
+		runTurnEnd(handlers);
+		expect(steers).toHaveLength(1);
 
 		// New round: before_agent_start resets the latches.
 		invokeHandler(handlers, "before_agent_start", {
@@ -933,23 +927,28 @@ describe("steering reminder injection", () => {
 			systemPromptOptions: { cwd: "/x" },
 		});
 
-		// The un-replaced pile is re-announced on the round's first LLM call.
-		const r2 = runContext(handlers, ids);
-		expect(r2.messages).toHaveLength(6);
-		expect(r2.messages[5].role).toBe("user");
+		// The un-replaced pile is re-announced at the round's first turn
+		// boundary — a fresh persisted reminder replaces the stale one.
+		runTurnEnd(handlers, 1);
+		expect(steers).toHaveLength(2);
+		expect(steeredText(steers.slice(1))).toContain("5 tool-result-pending-replacements");
 	});
 
-	it("appends the reminder as the LAST message", () => {
+	it("never appends a reminder in the context handler (persistence is the steer's job)", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 		const ids = ["t-1", "t-2"];
 		for (const id of ids) emitPending(handlers, id);
 
-		// A context event whose last message is an assistant message — the
-		// reminder must land after it, as the new tail.
-		const result = invokeHandler(handlers, "context", {
+		// The pile is above both thresholds, but the context event must stay
+		// a pure view transform: no synthetic trailing user message. The old
+		// per-call append was consumed for exactly one LLM call and never
+		// written to the session — that is the bug this path replaces.
+		const event = {
 			type: "context",
 			messages: [
+				{ role: "user", content: [{ type: "text", text: "run it" }] },
+				{ role: "assistant", content: [{ type: "text", text: "thinking" }] },
 				...ids.map((toolCallId) => ({
 					role: "toolResult",
 					toolCallId,
@@ -957,12 +956,18 @@ describe("steering reminder injection", () => {
 					content: [{ type: "text", text: LONG }],
 					isError: false,
 				})),
-				{ role: "assistant", content: [{ type: "text", text: "thinking" }] },
 			],
-		}) as { messages: Array<Record<string, unknown>> };
+		};
+
+		const result = invokeHandler(handlers, "context", event) as {
+			messages: Array<Record<string, unknown>>;
+		};
 
 		expect(result.messages).toHaveLength(4);
-		expect(result.messages[3].role).toBe("user");
+		expect(result.messages[0].role).toBe("user");
+		expect(result.messages[1].role).toBe("assistant");
+		expect(result.messages[2].role).toBe("toolResult");
+		expect(result.messages[3].role).toBe("toolResult");
 	});
 });
 

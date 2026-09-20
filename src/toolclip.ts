@@ -477,7 +477,7 @@ export default function toolclip(api: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 	api.on("before_agent_start", (event: BeforeAgentStartEvent) => {
 		// New round: reset the steering latches so a pending pile persisting
-		// into this round is re-announced on that round's first LLM call, and
+		// into this round is re-announced at that round's first turn boundary, and
 		// restart the per-round re-read counter.
 		resetSteering(steering);
 		resetRereads(state.readsThisRound);
@@ -553,45 +553,76 @@ export default function toolclip(api: ExtensionAPI): void {
 	});
 
 	// -----------------------------------------------------------------------
-	// 4. context event handler — swap replaced results before each LLM call,
-	//    and append a trailing steering reminder when either steering trigger
-	//    fires: the pending count strictly exceeds `steeringCountThreshold`
-	//    (default 5), or the pile's total estimated tokens strictly exceed
-	//    `steeringSizeThresholdTokens` (default 5000). Each trigger nags once
-	//    per excursion (independent latches; see lib/steering.ts).
+	// 4. context event handler — swap replaced results before each LLM call.
 	//
-	//    The reminder is appended as a NEW trailing user message — pi's
-	//    standard steering path. It touches only the tail; the cached prefix
-	//    (original prompt + all prior messages) is never modified.
+	//    Purely a view transform: nothing is appended, nothing is persisted.
+	//    The steering reminder used to be appended here as a trailing user
+	//    message, but that array is consumed for exactly one provider call
+	//    and never written to the session — the nag vanished after a single
+	//    glance. Delivery now goes through pi's native steering from the
+	//    turn_end handler (section 5); see lib/steering.ts.
 	// -----------------------------------------------------------------------
 	api.on("context", (event: ContextEvent) => {
-		const modified = event.messages.map((msg) => {
-			if (msg.role !== "toolResult") {
-				return msg;
-			}
-			const replacement = getReplacement(state, msg.toolCallId);
-			if (replacement === undefined) {
-				return msg;
-			}
-			// Swap content: replacement text + replaced marker
-			return {
-				...msg,
-				content: [
-					{ type: "text" as const, text: replacement },
-					{ type: "text" as const, text: buildReplacedMarker(msg.toolCallId) },
-				],
-			};
-		});
+		return {
+			messages: event.messages.map((msg) => {
+				if (msg.role !== "toolResult") {
+					return msg;
+				}
+				const replacement = getReplacement(state, msg.toolCallId);
+				if (replacement === undefined) {
+					return msg;
+				}
+				// Swap content: replacement text + replaced marker
+				return {
+					...msg,
+					content: [
+						{ type: "text" as const, text: replacement },
+						{ type: "text" as const, text: buildReplacedMarker(msg.toolCallId) },
+					],
+				};
+			}),
+		};
+	});
 
-		// Steering reminder: count + size triggers. Observe the pending pile
-		// first — the count trigger fires when the count strictly exceeds its
-		// threshold, the size trigger when the pile's total estimated tokens
-		// strictly exceed theirs; each latches until its condition falls back
-		// to (or below) the threshold, and the latches are independent (a
-		// single huge item with count = 1 is caught by the size trigger — the
-		// count trigger is blind to it). The reminder lands LAST in the
-		// returned messages so it is the freshest context the model sees —
-		// and the prefix up to it stays cached.
+	// -----------------------------------------------------------------------
+	// 5. turn_start / turn_end — quarantine bookkeeping + steering delivery.
+	//
+	//    pi delivers a turn's tool results at that turn's turn_end, so the
+	//    LLM first sees a quarantine notice when it generates the NEXT turn
+	//    (`createdTurn + 1`). That next turn is the only read window; reads
+	//    execute during it, before its turn_end. Eviction at turn_end with
+	//    `createdTurn <= turnIndex - 1` therefore frees still-unread payloads
+	//    exactly when their one-turn window closes, without ever evicting a
+	//    payload that could not yet have been read.
+	//
+	//    turn_end is also the steering observation point. pi's agent loop
+	//    polls the steering queue immediately after turn_end, so a steer
+	//    enqueued in this handler is delivered at this same boundary: the
+	//    reminder becomes a persisted user message, visible from the very
+	//    next LLM call onward (see lib/steering.ts for the full mechanism).
+	// -----------------------------------------------------------------------
+	api.on("turn_start", (event: TurnStartEvent) => {
+		state.currentTurn = event.turnIndex;
+	});
+
+	api.on("turn_end", (event: TurnEndEvent) => {
+		evictExpiredQuarantines(state, event.turnIndex);
+
+		// Steering reminder: count + size triggers, observed at the turn
+		// boundary — after this turn's tool results are in (new pending marks
+		// and replacements recorded), so the snapshot is the freshest the
+		// boundary can see. The count trigger fires when the count strictly
+		// exceeds its threshold, the size trigger when the pile's total
+		// estimated tokens strictly exceed theirs; each latches until its
+		// condition falls back to (or below) the threshold, and the latches
+		// are independent (a single huge item with count = 1 is caught by the
+		// size trigger — the count trigger is blind to it). On a fire, the
+		// reminder is enqueued via pi's native steering (`deliverAs: "steer"`):
+		// it is persisted as a real user message at the next turn boundary and
+		// stays part of the session's messages — visible in every subsequent
+		// LLM call, and in compaction/summarization — until the pile is
+		// distilled. `sendUserMessage` is fire-and-forget (pi catches and
+		// surfaces errors internally).
 		const pending = pendingSummary(state);
 		const triggers = observePendingSteering(
 			steering,
@@ -604,37 +635,10 @@ export default function toolclip(api: ExtensionAPI): void {
 			},
 		);
 		if (triggers.count || triggers.size) {
-			modified.push({
-				role: "user" as const,
-				content: [
-					{
-						type: "text" as const,
-						text: buildSteeringMessage(pending.items.length, pending.totalTokens, pending.items),
-					},
-				],
-				timestamp: Date.now(),
-			});
+			api.sendUserMessage(
+				buildSteeringMessage(pending.items.length, pending.totalTokens, pending.items),
+				{ deliverAs: "steer" },
+			);
 		}
-
-		return { messages: modified };
-	});
-
-	// -----------------------------------------------------------------------
-	// 5. turn_start / turn_end — quarantine bookkeeping.
-	//
-	//    pi delivers a turn's tool results at that turn's turn_end, so the
-	//    LLM first sees a quarantine notice when it generates the NEXT turn
-	//    (`createdTurn + 1`). That next turn is the only read window; reads
-	//    execute during it, before its turn_end. Eviction at turn_end with
-	//    `createdTurn <= turnIndex - 1` therefore frees still-unread payloads
-	//    exactly when their one-turn window closes, without ever evicting a
-	//    payload that could not yet have been read.
-	// -----------------------------------------------------------------------
-	api.on("turn_start", (event: TurnStartEvent) => {
-		state.currentTurn = event.turnIndex;
-	});
-
-	api.on("turn_end", (event: TurnEndEvent) => {
-		evictExpiredQuarantines(state, event.turnIndex);
 	});
 }

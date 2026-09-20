@@ -60,16 +60,16 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
  * a replacement grew larger than its original (the observation target); no
  * rejection happens.
  *
- * The steering reminder is a trailing user message injected when either
- * steering trigger fires: the number of un-replaced pending results strictly
- * exceeds `steeringCountThreshold` (default 5), or their total estimated
- * size strictly exceeds `steeringSizeThresholdTokens` (default 5000). Each
+ * The steering reminder is delivered via pi's native steering when either
+ * trigger fires: the number of un-replaced pending results strictly exceeds
+ * `steeringCountThreshold` (default 5), or their total estimated size
+ * strictly exceeds `steeringSizeThresholdTokens` (default 5000). Each
  * trigger nags once per excursion (its latch re-arms when its condition
  * falls back to the threshold), and the two latches are independent — one
  * trigger's fire never suppresses the other's. The reminder lists the
- * pending ids with their sizes. It is cache-safe — it is appended to the
- * *end* of the context (a new user block), so the cached prefix is never
- * touched.
+ * pending ids with their sizes. It is sent with `deliverAs: "steer"`, so pi
+ * persists it as a real user message at the next turn boundary — part of
+ * the session's messages, visible in every subsequent LLM call.
  *
  * Quarantine: results above `quarantineThresholdTokens` (default 10000) are
  * withheld from the LLM entirely — the content is swapped for a notice and

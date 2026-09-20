@@ -29,12 +29,30 @@
  *
  * Round boundary: state resets at each round boundary (in
  * `before_agent_start`) so a pile persisting into a new round is re-announced
- * on that round's first LLM call.
+ * at that round's first turn boundary.
  *
- * Cache safety: the reminder is appended to the *end* of the context as a new
- * `user` message. Pi's standard steering path does exactly this — a user
- * message added at the tail does not touch the cached prefix; only the tail
- * re-prepills. The original prompt and all prior messages are untouched.
+ * Delivery: pi-native steering. On a trigger fire the caller enqueues the
+ * reminder via `api.sendUserMessage(text, { deliverAs: "steer" })` — pi's
+ * real steering path. The message is queued on the agent's steering queue,
+ * drained at the next turn boundary, and PERSISTED as a real user message
+ * in the session: it becomes part of the session's message list, is visible
+ * in every subsequent LLM call, and is included in compaction and
+ * summarization. That persistence is the point — a nag that flashes for a
+ * single LLM call (a synthetic append in the `context` handler) is
+ * structurally incapable of nagging: the post-fix golden run of 2026-09-20
+ * showed the pile above both thresholds for 119 consecutive calls while the
+ * model saw each nag exactly once.
+ *
+ * Observation point: `turn_end`, after the turn's tool results are in and
+ * replacements recorded — the freshest pile state the boundary can see. The
+ * agent loop polls the steering queue immediately after `turn_end`, so a
+ * steer enqueued there is delivered at that same boundary: visible from the
+ * very next LLM call onward. Two consequences of the native path: a pile
+ * above threshold at a run's final turn forces one more turn (the model must
+ * at least see the nag), and the message text is computed at observation
+ * time — ids and totals can be mildly stale if a later turn changes the pile
+ * before the message is read (subsequent observations still fire on correct
+ * data).
  *
  * This module is pure: it owns the per-round steering state and exposes the
  * eligibility decision plus the message builder. No pi deps, no I/O — mirrors
@@ -46,7 +64,7 @@ import type { ToolclipRuntimeState } from "./types.ts";
 /**
  * Per-round steering state. Reset at each round boundary (in
  * `before_agent_start`) so a pile persisting into a new round is re-announced
- * on that round's first LLM call.
+ * at that round's first turn boundary.
  *
  * Each latch is true once its trigger has fired for the current excursion
  * above its threshold; both re-arm when their condition falls back to (or
@@ -129,7 +147,8 @@ export function unreplacedPendingIds(rt: ToolclipRuntimeState): string[] {
 
 /**
  * Observe the current pending pile and decide whether a steering reminder
- * should fire on this LLM call.
+ * should fire at this turn boundary (the caller observes from `turn_end`,
+ * after the turn's tool results are in — one observation per turn).
  *
  * Each trigger is edge-triggered with its own latch: it fires exactly when
  * its condition first becomes true (strictly above the threshold) and latches
