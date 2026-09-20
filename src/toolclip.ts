@@ -275,19 +275,23 @@ export default function toolclip(api: ExtensionAPI): void {
 		name: "replace_tool_result",
 		label: "Replace Tool Result",
 		description:
-			"Replace tool results you have already read with tight summaries. " +
+			"Replace tool results you have finished extracting with complete summaries. " +
 			"Pass an `items` array of {toolCallId, replacement} pairs — one call can " +
-			"replace many results at once. You SHOULD call this for every " +
-			"[tool-result-pending-replacement: ...] marker as soon as you have " +
-			"extracted the relevant information. Do not defer replacement — the " +
-			"earlier you replace, the more context you save.",
+			"replace many results at once. Method for each marked result: read it once, " +
+			"extract ALL the information you may still need for the rest of the task into " +
+			"the replacement, then replace. A replacement is irreversible — the original " +
+			"is swapped out for good, and anything you failed to capture requires a fresh " +
+			"full tool call to recover. So never replace while you still expect to consult " +
+			"the full detail; and once extraction is complete, replace immediately — an " +
+			"un-replaced result keeps costing context on every later call.",
 		promptSnippet:
 			"IMPORTANT: Call `replace_tool_result({ items: [{ toolCallId, replacement }, ...] })` " +
-			"for every [tool-result-pending-replacement: ...] marker you see. Batch many " +
-			"replacements into a single call. Extract the key information from each tool " +
-			"result, then replace it. Large tool results consume context tokens that could " +
-			"be used for reasoning. Replace them as soon as you can derive the relevant " +
-			"information from a single result.",
+			"for every [tool-result-pending-replacement: ...] marker whose result you have read. " +
+			"Batch many replacements into a single call. Method: extract ALL information you may " +
+			"need later — numbers, paths, decisions, excerpts — into the replacement, then replace. " +
+			"Replacement is irreversible: after it, the full original is gone, and recovering " +
+			"anything you missed costs a fresh full tool call. Once extraction is complete, replace " +
+			"immediately; do not defer, and do not replace half-informed.",
 		parameters: Type.Object({
 			items: Type.Array(
 				Type.Object({
@@ -296,9 +300,10 @@ export default function toolclip(api: ExtensionAPI): void {
 					}),
 					replacement: Type.String({
 						description:
-							"Tight summary of the tool result: the key numbers, paths, " +
-							"decisions, or excerpts you will need later — enough to answer " +
-							"future questions that depend on this result.",
+							"Tight but complete summary of the tool result: capture ALL the key " +
+							"numbers, paths, decisions, or excerpts you may need later — not just " +
+							"for the next step. After replacement the original is unretrievable " +
+							"except by re-running the tool, so include anything you might consult.",
 					}),
 				}),
 				{ minItems: 1 },
@@ -419,28 +424,35 @@ export default function toolclip(api: ExtensionAPI): void {
 		const toolclipInstructions =
 			"\n## Tool Result Replacement\n" +
 			"When a long tool result has a [tool-result-pending-replacement: ...] marker, " +
-			"you MUST call `replace_tool_result({ items: [{ toolCallId, replacement }, ...] })` " +
-			"once you have extracted what you need from that result — before you make the next " +
-			"tool call or write your final answer. Batch many replacements into a single call.\n" +
+			"you MUST replace it with `replace_tool_result({ items: [{ toolCallId, replacement }, ...] })` " +
+			"before you make the next tool call or write your final answer. Batch many replacements " +
+			"into a single call. Use one method, every time:\n" +
+			"1. READ the result once, in full.\n" +
+			"2. EXTRACT all the information you may still need for the rest of the task — numbers, " +
+			"error codes, paths, decisions, excerpts, state — into the replacement. Not just what " +
+			"the next step needs: anything you might consult later goes in now.\n" +
+			"3. REPLACE. The swap is irreversible: the full original is dropped from your context " +
+			"for good, and recovering anything you failed to capture means re-running the tool at " +
+			"full cost.\n" +
+			"Replacement is a completion step of extraction, not optional cleanup. But the " +
+			"extraction must be complete BEFORE you replace. Replacing too early is the expensive " +
+			"mistake: you lose the detail, discover the loss a turn later, and pay for a full " +
+			"re-read. Deferring replacement after extraction is also expensive: the un-replaced " +
+			"original keeps costing context on every later call.\n" +
 			"Before you write your final answer, do the sweep. Replace, in a single " +
 			"`replace_tool_result` call, every marked result you have already read but not yet " +
 			"replaced. Having the answer ready is no reason to leave them: if nothing remains " +
 			"marked-and-read, the sweep is a no-op — say so in one line and then answer.\n" +
-			"- Replacement is a completion step of extraction, not optional cleanup. The trigger " +
-			"  is simple: once you have captured the relevant information from a marked result " +
-			"  into your reasoning or into your replacement, that result is spent — replace it now.\n" +
 			"- The larger the original, the more context you save, so large results are the " +
 			"  priority. Do not let size become a reason to keep the full original around.\n" +
-			"- Capture what you need: key numbers, error codes, paths, decisions, or state " +
-			"  summaries — enough to answer future questions that depend on this result. Then " +
-			"  replace the full output with that distilled summary.\n" +
+			"- Keep each replacement tight relative to the original — never re-quote whole files " +
+			"  or listings — but complete relative to your future needs: a missing detail costs a " +
+			"  full re-read, an included one costs a line.\n" +
 			"- Drop verbose output such as file contents, full directory listings, or exhaustive " +
 			"  search results as soon as you have extracted the relevant parts.\n" +
 			"- Do NOT keep a result because you might quote it later. If you will reference a " +
 			"  specific excerpt, put that excerpt into the replacement now and replace the " +
 			"  whole result — do not park the full original for later quoting.\n" +
-			"- Keep each replacement tight: the point is to free context, so capture only " +
-			"  what you will actually need later.\n" +
 			"- The only valid reason to keep a marked result un-replaced is that you have not " +
 			"  yet read it. Once you have read it, replace it before moving on.\n" +
 			"\n## Quarantined Tool Results\n" +

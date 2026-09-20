@@ -16,6 +16,8 @@ The LLM is the only actor. There is no auto-summarizer and no auto-eviction. The
    ```
    The original content is **not** modified. Only results strictly above the token threshold (default 1000) are marked — smaller results are too cheap to distill.
 2. The LLM can call `replace_tool_result(toolCallId, replacement)` at its leisure. **No length gate is applied** — replacements of any size are accepted. The tool records a `grew` flag (`replacementTokens >= originalTokens`) in its details so observers can detect replacements that bloat rather than shrink context. That flag is the signal for reintroducing a length gate later.
+
+   The injected directive gives the model a method, not just an urge: read once → extract **all** the information you may still need for the rest of the task (not just the next step) into the replacement → replace. A replacement is **irreversible** — the original is swapped out for good, and anything the model failed to capture requires a fresh full tool call. Early wording ("the earlier you replace, the more context you save") pushed a compliant model into a distill-refetch loop: replace minimal → lose detail → re-read the same file at full price. The wording now names both expensive mistakes: replacing half-informed, and deferring after extraction is complete.
 3. On the `context` event (before each LLM call), any `ToolResultMessage` whose `toolCallId` has a stored replacement is swapped to:
    ```
    <replacement>

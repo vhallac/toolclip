@@ -120,7 +120,10 @@ export function markFired(state: SteeringState): void {
 
 /**
  * Build the steering reminder text. Single line of user steering, scoped to
- * the current pending set. Kept short and imperative.
+ * the current pending set. Kept short and imperative. Aligned with the
+ * system-prompt method: extract ALL you may still need into the replacement,
+ * then replace — the two failure modes are replacing half-informed (and
+ * re-fetching later) and not replacing at all.
  *
  * @param unreplaced - How many marked results are still un-replaced.
  */
@@ -129,7 +132,7 @@ export function buildSteeringMessage(unreplaced: number): string {
 	return (
 		`Reminder: ${unreplaced} ${noun} still carrying the ` +
 		`[tool-result-pending-replacement] marker. Per the system instructions, ` +
-		`replace each with a distilled replace_tool_result(toolCallId, replacement) ` +
-		`call before proceeding further — you have already extracted what you need.`
+		`extract ALL information you may still need from each into its replacement, ` +
+		`then replace them in a single replace_tool_result call before proceeding further.`
 	);
 }

@@ -725,10 +725,25 @@ describe("before_agent_start handler", () => {
 		// Key directives of the sharpened prompt are present.
 		expect(result.systemPrompt).toContain("## Tool Result Replacement");
 		expect(result.systemPrompt).toContain(
-			"you MUST call `replace_tool_result({ items: [{ toolCallId, replacement }, ...] })` once you have",
+			"you MUST replace it with `replace_tool_result({ items: [{ toolCallId, replacement }, ...] })`",
+		);
+		// The extract-all-then-replace method (read → extract ALL → replace).
+		expect(result.systemPrompt).toContain("1. READ the result once, in full.");
+		expect(result.systemPrompt).toContain(
+			"2. EXTRACT all the information you may still need for the rest of the task",
+		);
+		expect(result.systemPrompt).toContain(
+			"Not just what the next step needs: anything you might consult later goes in now",
+		);
+		expect(result.systemPrompt).toContain("3. REPLACE. The swap is irreversible");
+		expect(result.systemPrompt).toContain(
+			"recovering anything you failed to capture means re-running the tool at full cost",
 		);
 		expect(result.systemPrompt).toContain(
 			"Replacement is a completion step of extraction, not optional cleanup",
+		);
+		expect(result.systemPrompt).toContain(
+			"the extraction must be complete BEFORE you replace",
 		);
 		expect(result.systemPrompt).toContain(
 			"Do not let size become a reason to keep the full original around",
@@ -743,6 +758,13 @@ describe("before_agent_start handler", () => {
 		// Size-gate language was removed — these phrases must NOT appear.
 		expect(result.systemPrompt).not.toContain("strictly shorter than the original");
 		expect(result.systemPrompt).not.toContain("configured ratio");
+		// The old one-way-door wording must not come back.
+		expect(result.systemPrompt).not.toContain(
+			"the earlier you replace, the more context you save",
+		);
+		expect(result.systemPrompt).not.toContain(
+			"as soon as you can derive the relevant information from a single result",
+		);
 	});
 
 	it("appends to an empty system prompt", () => {
@@ -764,8 +786,9 @@ describe("before_agent_start handler", () => {
 		expect(result.systemPrompt).toContain("## Tool Result Replacement");
 		expect(result.systemPrompt).toContain("replace_tool_result");
 		expect(result.systemPrompt).toContain(
-			"you MUST call `replace_tool_result({ items: [{ toolCallId, replacement }, ...] })` once you have",
+			"you MUST replace it with `replace_tool_result({ items: [{ toolCallId, replacement }, ...] })`",
 		);
+		expect(result.systemPrompt).toContain("3. REPLACE. The swap is irreversible");
 	});
 
 	it("keeps the original prompt when no handler is registered", () => {
