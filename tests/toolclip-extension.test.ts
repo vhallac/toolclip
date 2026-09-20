@@ -146,13 +146,33 @@ describe("tool_result handler", () => {
 		expect(originalContent).toHaveLength(1);
 		expect(originalContent[0].text).toBe("x".repeat(2500));
 	});
+
+	it("does NOT append a marker to the result of replace_tool_result itself (self-replacement guard)", () => {
+		// Regression: without the toolName guard, every replace_tool_result
+		// call's own result ("Stored N replacements…") would get a pending
+		// marker, inducing a loop where the LLM re-replaces its own
+		// replacement results. The handler must early-return for its own tool.
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+
+		const result = invokeHandler(handlers, "tool_result", {
+			type: "tool_result",
+			toolCallId: "replace-call-1",
+			toolName: "replace_tool_result",
+			content: [{ type: "text", text: "Stored 1 replacement. Originals will be swapped in subsequent LLM calls: - foo: 4 tokens (was 500)" }],
+			isError: false,
+		});
+
+		// No marker appended — the handler returned undefined.
+		expect(result).toBeUndefined();
+	});
 });
 
 // -----------------------------------------------------------------------
 // replace_tool_result tool tests
 // -----------------------------------------------------------------------
 describe("replace_tool_result tool", () => {
-	it("accepts a replacement shorter than the original (grew=false)", async () => {
+	it("accepts a single-pair array and records the replacement (grew=false)", async () => {
 		const { handlers, pi, tools } = createMockApi();
 		toolclip(pi as never);
 
@@ -166,17 +186,42 @@ describe("replace_tool_result tool", () => {
 		});
 
 		const result = (await invokeTool(tools, "replace_tool_result", "tool-1", {
-			toolCallId: "tool-1",
-			replacement: "short summary",
+			items: [{ toolCallId: "tool-1", replacement: "short summary" }],
 		})) as { content: Array<{ type: string; text: string }>; details: Record<string, unknown> };
 
 		expect(result.details).toMatchObject({ ok: true });
-		expect(result.details.originalTokens).toBe(500);
-		expect(result.details.replacementTokens).toBe(4);
-		expect(result.details.grew).toBe(false);
+		const r0 = (result.details.results as Array<Record<string, unknown>>)[0];
+		expect(r0).toMatchObject({ toolCallId: "tool-1", ok: true });
+		expect(r0.originalTokens).toBe(500);
+		expect(r0.replacementTokens).toBe(4);
+		expect(r0.grew).toBe(false);
 	});
 
-	it("accepts a replacement longer than the original (no gate) and flags grew=true", async () => {
+	it("accepts a bare single-pair object (robustness) and records it", async () => {
+		// Some models may emit a single object instead of an {items} array.
+		// The handler normalizes both shapes.
+		const { handlers, pi, tools } = createMockApi();
+		toolclip(pi as never);
+
+		invokeHandler(handlers, "tool_result", {
+			type: "tool_result",
+			toolCallId: "tool-bare",
+			toolName: "bash",
+			content: [{ type: "text", text: "x".repeat(2000) }],
+			isError: false,
+		});
+
+		const result = (await invokeTool(tools, "replace_tool_result", "tool-bare", {
+			toolCallId: "tool-bare",
+			replacement: "bare summary",
+		})) as { details: Record<string, unknown> };
+
+		expect(result.details).toMatchObject({ ok: true });
+		const r0 = (result.details.results as Array<Record<string, unknown>>)[0];
+		expect(r0).toMatchObject({ toolCallId: "tool-bare", ok: true, grew: false });
+	});
+
+	it("accepts a replacement larger than the original (no gate) and flags grew=true", async () => {
 		// Size thresholds removed: a replacement larger than the original is
 		// accepted. The `grew` flag is the observation target — if we see it
 		// true in real runs, that is the signal to reintroduce a gate.
@@ -194,14 +239,14 @@ describe("replace_tool_result tool", () => {
 
 		// 1300 chars / 4 = 325 tokens > 300 original — previously hard-failed.
 		const result = (await invokeTool(tools, "replace_tool_result", "tool-grew", {
-			toolCallId: "tool-grew",
-			replacement: "x".repeat(1300),
+			items: [{ toolCallId: "tool-grew", replacement: "x".repeat(1300) }],
 		})) as { details: Record<string, unknown> };
 
-		expect(result.details).toMatchObject({ ok: true });
-		expect(result.details.originalTokens).toBe(300);
-		expect(result.details.replacementTokens).toBe(325);
-		expect(result.details.grew).toBe(true);
+		const r0 = (result.details.results as Array<Record<string, unknown>>)[0];
+		expect(r0).toMatchObject({ ok: true });
+		expect(r0.originalTokens).toBe(300);
+		expect(r0.replacementTokens).toBe(325);
+		expect(r0.grew).toBe(true);
 	});
 
 	it("accepts a replacement that previously would have soft-failed the ratio", async () => {
@@ -219,24 +264,25 @@ describe("replace_tool_result tool", () => {
 		// 500 chars / 4 = 125 tokens vs 1000 original → ratio 0.125, previously
 		// rejected by the 0.1 soft-fail ceiling. Now accepted.
 		const result = (await invokeTool(tools, "replace_tool_result", "tool-soft", {
-			toolCallId: "tool-soft",
-			replacement: "y".repeat(500),
+			items: [{ toolCallId: "tool-soft", replacement: "y".repeat(500) }],
 		})) as { details: Record<string, unknown> };
 
-		expect(result.details).toMatchObject({ ok: true, grew: false });
+		const r0 = (result.details.results as Array<Record<string, unknown>>)[0];
+		expect(r0).toMatchObject({ ok: true, grew: false });
 	});
 
-	it("returns error for unknown toolCallId", async () => {
+	it("returns error for unknown toolCallId in a batch", async () => {
 		const { handlers, pi, tools } = createMockApi();
 		toolclip(pi as never);
 
-		const result = (await invokeTool(tools, "replace_tool_result", "nonexistent", {
-			toolCallId: "nonexistent",
-			replacement: "whatever",
+		const result = (await invokeTool(tools, "replace_tool_result", "call-1", {
+			items: [{ toolCallId: "nonexistent", replacement: "whatever" }],
 		})) as { content: Array<{ type: string; text: string }>; details: Record<string, unknown> };
 
-		expect(result.details).toMatchObject({ ok: false, reason: "unknown id" });
-		expect(result.content[0].text).toContain('"nonexistent"');
+		expect(result.details).toMatchObject({ ok: true }); // the call itself succeeded
+		const r0 = (result.details.results as Array<Record<string, unknown>>)[0];
+		expect(r0).toMatchObject({ toolCallId: "nonexistent", ok: false, reason: "unknown id" });
+		expect(result.content[0].text).toContain("nonexistent");
 	});
 
 	it("is idempotent: calling again with same id updates the replacement", async () => {
@@ -252,17 +298,17 @@ describe("replace_tool_result tool", () => {
 		});
 
 		const res1 = (await invokeTool(tools, "replace_tool_result", "tool-idem", {
-			toolCallId: "tool-idem",
-			replacement: "ver1",
+			items: [{ toolCallId: "tool-idem", replacement: "ver1" }],
 		})) as { details: Record<string, unknown> };
-		expect(res1.details.ok).toBe(true);
+		const r1 = (res1.details.results as Array<Record<string, unknown>>)[0];
+		expect(r1.ok).toBe(true);
 
 		const res2 = (await invokeTool(tools, "replace_tool_result", "tool-idem", {
-			toolCallId: "tool-idem",
-			replacement: "v2",
+			items: [{ toolCallId: "tool-idem", replacement: "v2" }],
 		})) as { details: Record<string, unknown> };
-		expect(res2.details.ok).toBe(true);
-		expect(res2.details.replacementTokens).toBe(1);
+		const r2 = (res2.details.results as Array<Record<string, unknown>>)[0];
+		expect(r2.ok).toBe(true);
+		expect(r2.replacementTokens).toBe(1);
 	});
 
 	it("handles zero-length replacement (0 tokens)", async () => {
@@ -278,11 +324,64 @@ describe("replace_tool_result tool", () => {
 		});
 
 		const result = (await invokeTool(tools, "replace_tool_result", "tool-zero", {
-			toolCallId: "tool-zero",
-			replacement: "",
+			items: [{ toolCallId: "tool-zero", replacement: "" }],
 		})) as { details: Record<string, unknown> };
 
-		expect(result.details).toMatchObject({ ok: true, grew: false });
+		const r0 = (result.details.results as Array<Record<string, unknown>>)[0];
+		expect(r0).toMatchObject({ ok: true, grew: false });
+	});
+
+	it("replaces multiple results in a single batch call", async () => {
+		const { handlers, pi, tools } = createMockApi();
+		toolclip(pi as never);
+
+		// Two pending entries + one unknown id in the same batch.
+		invokeHandler(handlers, "tool_result", {
+			type: "tool_result",
+			toolCallId: "batch-a",
+			toolName: "bash",
+			content: [{ type: "text", text: "x".repeat(2000) }],
+			isError: false,
+		});
+		invokeHandler(handlers, "tool_result", {
+			type: "tool_result",
+			toolCallId: "batch-b",
+			toolName: "bash",
+			content: [{ type: "text", text: "x".repeat(4000) }],
+			isError: false,
+		});
+
+		const result = (await invokeTool(tools, "replace_tool_result", "call-1", {
+			items: [
+				{ toolCallId: "batch-a", replacement: "summary a" },
+				{ toolCallId: "batch-b", replacement: "summary b" },
+				{ toolCallId: "no-such-id", replacement: "ghost" },
+			],
+		})) as { content: Array<{ type: string; text: string }>; details: Record<string, unknown> };
+
+		expect(result.details).toMatchObject({ ok: true });
+		const results = result.details.results as Array<Record<string, unknown>>;
+		expect(results).toHaveLength(3);
+		expect(results[0]).toMatchObject({ toolCallId: "batch-a", ok: true, grew: false });
+		expect(results[1]).toMatchObject({ toolCallId: "batch-b", ok: true, grew: false });
+		expect(results[2]).toMatchObject({ toolCallId: "no-such-id", ok: false, reason: "unknown id" });
+		// Summary text lists both stored and the skipped unknown.
+		expect(result.content[0].text).toContain("Stored 2 replacements");
+		expect(result.content[0].text).toContain("batch-a");
+		expect(result.content[0].text).toContain("batch-b");
+		expect(result.content[0].text).toContain("Skipped 1 unknown id");
+		expect(result.content[0].text).toContain("no-such-id");
+	});
+
+	it("rejects invalid arguments (neither items array nor single pair)", async () => {
+		const { handlers, pi, tools } = createMockApi();
+		toolclip(pi as never);
+
+		const result = (await invokeTool(tools, "replace_tool_result", "call-1", {
+			items: "not-an-array",
+		})) as { details: Record<string, unknown> };
+
+		expect(result.details).toMatchObject({ ok: false, reason: "invalid arguments" });
 	});
 });
 
@@ -304,8 +403,7 @@ describe("context event handler", () => {
 		});
 
 		await invokeTool(tools, "replace_tool_result", "replaced-1", {
-			toolCallId: "replaced-1",
-			replacement: "shortened",
+			items: [{ toolCallId: "replaced-1", replacement: "shortened" }],
 		});
 
 		// Now fire the context event with a mixed set of messages
@@ -599,7 +697,7 @@ describe("before_agent_start handler", () => {
 		// Key directives of the sharpened prompt are present.
 		expect(result.systemPrompt).toContain("## Tool Result Replacement");
 		expect(result.systemPrompt).toContain(
-			"you MUST call `replace_tool_result(toolCallId, replacement)` once you have",
+			"you MUST call `replace_tool_result({ items: [{ toolCallId, replacement }, ...] })` once you have",
 		);
 		expect(result.systemPrompt).toContain(
 			"Replacement is a completion step of extraction, not optional cleanup",
@@ -632,7 +730,7 @@ describe("before_agent_start handler", () => {
 		expect(result.systemPrompt).toContain("## Tool Result Replacement");
 		expect(result.systemPrompt).toContain("replace_tool_result");
 		expect(result.systemPrompt).toContain(
-			"you MUST call `replace_tool_result(toolCallId, replacement)` once you have",
+			"you MUST call `replace_tool_result({ items: [{ toolCallId, replacement }, ...] })` once you have",
 		);
 	});
 

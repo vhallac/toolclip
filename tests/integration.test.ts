@@ -61,13 +61,13 @@ describe("toolclip — smoke integration", () => {
 
 		// 3. LLM decides to call replace_tool_result.
 		const replaceResult = (await invokeTool(tools, "replace_tool_result", "llm-call-1", {
-			toolCallId: "bash-1",
-			replacement: "ok, build passed",
+			items: [{ toolCallId: "bash-1", replacement: "ok, build passed" }],
 		})) as { details: Record<string, unknown> };
 
 		expect(replaceResult.details).toMatchObject({ ok: true });
-		expect(replaceResult.details.originalTokens).toBe(500);
-		expect(replaceResult.details.replacementTokens).toBe(4);
+		const rr = (replaceResult.details.results as Array<Record<string, unknown>>)[0];
+		expect(rr.originalTokens).toBe(500);
+		expect(rr.replacementTokens).toBe(4);
 
 		// 4. Next `context` event shows the swap (cache-break point).
 		const secondContext = invokeHandler(handlers, "context", {
@@ -143,8 +143,7 @@ describe("toolclip — smoke integration", () => {
 		}) as { content: Array<{ type: string; text: string }> };
 
 		await invokeTool(tools, "replace_tool_result", "llm-call-1", {
-			toolCallId: "grep-1",
-			replacement: "match in line 42",
+			items: [{ toolCallId: "grep-1", replacement: "match in line 42" }],
 		});
 
 		// Build a context event with the original (marker-included) content.
@@ -202,8 +201,7 @@ describe("toolclip — smoke integration", () => {
 		}) as { content: Array<{ type: string; text: string }> };
 
 		await invokeTool(tools, "replace_tool_result", "llm-call-1", {
-			toolCallId: "replaced-1",
-			replacement: "tight summary",
+			items: [{ toolCallId: "replaced-1", replacement: "tight summary" }],
 		});
 
 		// 3. Short result → pending entry (threshold removed) but NOT replaced.

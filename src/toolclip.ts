@@ -3,8 +3,16 @@
  *
  * Listens to the `tool_result` event; appends a pending-replacement marker
  * to the LLM-facing content of every non-empty text tool result. Registers
- * `replace_tool_result(id, replacement)` so the LLM can swap the bulky
- * original for a tight replacement in subsequent turns.
+ * `replace_tool_result(items)` so the LLM can swap bulky originals for tight
+ * replacements in subsequent turns. `items` is an array of
+ * `{toolCallId, replacement}` pairs, so a single call can replace many
+ * results at once.
+ *
+ * The `tool_result` handler skips its own tool (`replace_tool_result`):
+ * without that guard, every replacement call's own result text
+ * ("Replacement stored for …") would get a pending marker, inducing a
+ * self-replacement loop where the LLM dutifully re-replaces its own
+ * replacement results — burning tokens for no gain.
  *
  * Size-bound thresholds (marker threshold + max-replacement-ratio) have been
  * removed so replacement behavior can be observed without pre-filtering or
@@ -98,6 +106,17 @@ export default function toolclip(api: ExtensionAPI): void {
 	// 1. tool_result event handler
 	// -----------------------------------------------------------------------
 	api.on("tool_result", (event: ToolResultEvent) => {
+		// Guard against the self-replacement loop: the result of a
+		// `replace_tool_result` call itself ("Replacement stored for …") must
+		// NOT get a pending marker. Without this, every replacement call's own
+		// result becomes a new pending entry, and the LLM is nudged to replace
+		// its own replacement results — a converging-but-wasteful loop. The
+		// tool's own output is short by construction and is never something to
+		// distill.
+		if (event.toolName === "replace_tool_result") {
+			return;
+		}
+
 		const tokens = estimateToolResultTokens(event.content);
 		// No size threshold: every non-empty text result gets a marker so we
 		// can observe replacement behavior broadly. Empty results are skipped
@@ -121,73 +140,148 @@ export default function toolclip(api: ExtensionAPI): void {
 
 	// -----------------------------------------------------------------------
 	// 2. replace_tool_result tool registration
+	//
+	//    Accepts an array of {toolCallId, replacement} pairs so the LLM can
+	//    replace many results in a single call — the natural shape for the
+	//    "replace everything I've finished extracting" step. For robustness,
+	//    the handler also accepts a single pair object (some models may emit
+	//    one object instead of an array); both shapes are handled.
 	// -----------------------------------------------------------------------
+	interface ReplacePair {
+		toolCallId: string;
+		replacement: string;
+	}
+
+	interface PairResult {
+		toolCallId: string;
+		ok: boolean;
+		reason?: string;
+		originalTokens?: number;
+		replacementTokens?: number;
+		grew?: boolean;
+	}
+
+	function applyOne(pair: ReplacePair): PairResult {
+		const entry = state.entries.get(pair.toolCallId);
+		if (!entry) {
+			return {
+				toolCallId: pair.toolCallId,
+				ok: false,
+				reason: "unknown id",
+			};
+		}
+		const replacementTokens = estimateTokens(pair.replacement);
+		// No size gate: accept any replacement. Record a `grew` flag when the
+		// replacement is at least as large as the original — the observation
+		// target. If we see `grew: true` in real runs, that is the signal to
+		// reintroduce a length gate.
+		recordReplacement(state, pair.toolCallId, pair.replacement, replacementTokens);
+		return {
+			toolCallId: pair.toolCallId,
+			ok: true,
+			originalTokens: entry.originalTokens,
+			replacementTokens,
+			grew: replacementTokens >= entry.originalTokens,
+		};
+	}
+
+	function summarizeResults(results: PairResult[]): string {
+		const stored = results.filter((r) => r.ok);
+		const lines: string[] = [];
+		if (stored.length > 0) {
+			lines.push(
+				`Stored ${stored.length} replacement${stored.length === 1 ? "" : "s"}. ` +
+					`Originals will be swapped in subsequent LLM calls:`,
+			);
+			for (const r of stored) {
+				lines.push(
+					`  - ${r.toolCallId}: ${r.replacementTokens} tokens ` +
+						`(was ${r.originalTokens}${r.grew ? ", grew" : ""})`,
+				);
+			}
+		}
+		const failed = results.filter((r) => !r.ok);
+		if (failed.length > 0) {
+			lines.push(
+				`Skipped ${failed.length} unknown id${failed.length === 1 ? "" : "s"}: ` +
+					failed.map((r) => r.toolCallId).join(", "),
+			);
+		}
+		return lines.join("\n");
+	}
+
 	api.registerTool({
 		name: "replace_tool_result",
 		label: "Replace Tool Result",
 		description:
-			"Replace a tool result you have already read with a tight summary. " +
-			"You SHOULD call this for every [tool-result-pending-replacement: ...] marker " +
-			"as soon as you have extracted the relevant information. " +
-			"Do not defer replacement — the earlier you replace, the more context you save.",
+			"Replace tool results you have already read with tight summaries. " +
+			"Pass an `items` array of {toolCallId, replacement} pairs — one call can " +
+			"replace many results at once. You SHOULD call this for every " +
+			"[tool-result-pending-replacement: ...] marker as soon as you have " +
+			"extracted the relevant information. Do not defer replacement — the " +
+			"earlier you replace, the more context you save.",
 		promptSnippet:
-			"IMPORTANT: Call `replace_tool_result(toolCallId, replacement)` for every " +
-			"[tool-result-pending-replacement: ...] marker you see. " +
-			"Extract the key information from the tool result, then replace it. " +
-			"Large tool results consume context tokens that could be used for reasoning. " +
-			"Replace them as soon as you can derive the relevant information from a single result.",
+			"IMPORTANT: Call `replace_tool_result({ items: [{ toolCallId, replacement }, ...] })` " +
+			"for every [tool-result-pending-replacement: ...] marker you see. Batch many " +
+			"replacements into a single call. Extract the key information from each tool " +
+			"result, then replace it. Large tool results consume context tokens that could " +
+			"be used for reasoning. Replace them as soon as you can derive the relevant " +
+			"information from a single result.",
 		parameters: Type.Object({
-			toolCallId: Type.String({
-				description: "The toolCallId from the [tool-result-pending-replacement: ...] marker.",
-			}),
-			replacement: Type.String({
-				description:
-					"Tight summary of the tool result: the key numbers, paths, " +
-					"decisions, or excerpts you will need later — enough to answer " +
-					"future questions that depend on this result.",
-			}),
+			items: Type.Array(
+				Type.Object({
+					toolCallId: Type.String({
+						description: "The toolCallId from the [tool-result-pending-replacement: ...] marker.",
+					}),
+					replacement: Type.String({
+						description:
+							"Tight summary of the tool result: the key numbers, paths, " +
+							"decisions, or excerpts you will need later — enough to answer " +
+							"future questions that depend on this result.",
+					}),
+				}),
+				{ minItems: 1 },
+			),
 		}),
 		async execute(
 			toolCallId: string,
-			params: { toolCallId: string; replacement: string },
+			params: { items: ReplacePair[] } | ReplacePair,
 			_signal: AbortSignal | undefined,
 			_onUpdate: AgentToolUpdateCallback<unknown> | undefined,
 			_ctx: ExtensionContext,
 		): Promise<AgentToolResult<unknown>> {
-			const entry = state.entries.get(params.toolCallId);
-			if (!entry) {
+			// Accept both the documented array form and a bare single-pair object
+			// for robustness against models that emit one object instead of an
+			// array. Normalize to an array of pairs.
+			let pairs: ReplacePair[];
+			if (Array.isArray((params as { items?: ReplacePair[] }).items)) {
+				pairs = (params as { items: ReplacePair[] }).items;
+			} else if (
+				typeof params === "object" &&
+				params !== null &&
+				typeof (params as ReplacePair).toolCallId === "string" &&
+				typeof (params as ReplacePair).replacement === "string"
+			) {
+				pairs = [params as ReplacePair];
+			} else {
 				return {
 					content: [
 						{
 							type: "text" as const,
-							text: `No pending tool result found for toolCallId "${params.toolCallId}". It may have already been replaced, or its result was below the threshold. Use get_tool_details or check the session history to find the correct id.`,
+							text: "Invalid arguments. Pass { items: [{ toolCallId, replacement }, ...] } " +
+								"with at least one pair.",
 						},
 					],
-					details: { ok: false, reason: "unknown id" },
+					details: { ok: false, reason: "invalid arguments" },
 				};
 			}
 
-			const replacementTokens = estimateTokens(params.replacement);
-
-			// No size gate: accept any replacement. Record a `grew` flag when the
-			// replacement is at least as large as the original — the observation
-			// target. If we see `grew: true` in real runs, that is the signal to
-			// reintroduce a length gate.
-			recordReplacement(state, params.toolCallId, params.replacement, replacementTokens);
+			const results = pairs.map(applyOne);
 			return {
 				content: [
-					{
-						type: "text" as const,
-						text: `Replacement stored for toolCallId "${params.toolCallId}". ` +
-							`The original result will be swapped in subsequent LLM calls.`,
-					},
+					{ type: "text" as const, text: summarizeResults(results) },
 				],
-				details: {
-					ok: true,
-					originalTokens: entry.originalTokens,
-					replacementTokens,
-					grew: replacementTokens >= entry.originalTokens,
-				},
+				details: { ok: true, results },
 			};
 		},
 	});
@@ -204,9 +298,9 @@ export default function toolclip(api: ExtensionAPI): void {
 		const toolclipInstructions =
 			"\n## Tool Result Replacement\n" +
 			"When a long tool result has a [tool-result-pending-replacement: ...] marker, " +
-			"you MUST call `replace_tool_result(toolCallId, replacement)` once you have " +
-			"extracted what you need from that result — before you make the next tool call or " +
-			"write your final answer.\n" +
+			"you MUST call `replace_tool_result({ items: [{ toolCallId, replacement }, ...] })` " +
+			"once you have extracted what you need from that result — before you make the next " +
+			"tool call or write your final answer. Batch many replacements into a single call.\n" +
 			"- Replacement is a completion step of extraction, not optional cleanup. The trigger " +
 			"  is simple: once you have captured the relevant information from a marked result " +
 			"  into your reasoning or into your replacement, that result is spent — replace it now.\n" +
@@ -220,7 +314,7 @@ export default function toolclip(api: ExtensionAPI): void {
 			"- Do NOT keep a result because you might quote it later. If you will reference a " +
 			"  specific excerpt, put that excerpt into the replacement now and replace the " +
 			"  whole result — do not park the full original for later quoting.\n" +
-			"- Keep the replacement tight: the point is to free context, so capture only " +
+			"- Keep each replacement tight: the point is to free context, so capture only " +
 			"  what you will actually need later.\n" +
 			"- The only valid reason to keep a marked result un-replaced is that you have not " +
 			"  yet read it. Once you have read it, replace it before moving on.\n";
