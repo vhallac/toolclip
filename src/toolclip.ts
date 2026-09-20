@@ -1,12 +1,16 @@
 /**
  * toolclip — Targeted context reduction for individual tool results.
  *
- * Listens to the `tool_result` event; when a result exceeds the token
- * threshold, appends a pending-replacement marker to the LLM-facing content.
- * Registers `replace_tool_result(id, replacement)` so the LLM can swap the
- * bulky original for a tight replacement in subsequent turns. The length gate
- * (hard + soft fail) prevents replacements that don't meaningfully shrink
- * context.
+ * Listens to the `tool_result` event; appends a pending-replacement marker
+ * to the LLM-facing content of every non-empty text tool result. Registers
+ * `replace_tool_result(id, replacement)` so the LLM can swap the bulky
+ * original for a tight replacement in subsequent turns.
+ *
+ * Size-bound thresholds (marker threshold + max-replacement-ratio) have been
+ * removed so replacement behavior can be observed without pre-filtering or
+ * gating. Replacements of any size are accepted; the tool records a `grew`
+ * flag when a replacement is at least as large as its original — the
+ * observation target for reintroducing limits later.
  *
  * The `context` event does the actual swap before each LLM call.
  *
@@ -29,7 +33,6 @@ import { loadToolclipConfig } from "../lib/toolclip-config.ts";
 import { createRuntimeState } from "../lib/runtime-state.ts";
 import { estimateTokens } from "../lib/tokens.ts";
 import { buildPendingMarker, buildReplacedMarker } from "../lib/marker.ts";
-import { validateReplacement } from "../lib/length-gate.ts";
 import {
 	recordPending,
 	recordReplacement,
@@ -79,18 +82,19 @@ function flattenContent(content: ToolResultEvent["content"]): string {
 }
 
 export default function toolclip(api: ExtensionAPI): void {
-	const config = loadToolclipConfig();
+	loadToolclipConfig(); // config plumbing kept; currently no size thresholds
 	const state: ToolclipRuntimeState = createRuntimeState();
 
 	// -----------------------------------------------------------------------
 	// 1. tool_result event handler
 	// -----------------------------------------------------------------------
 	api.on("tool_result", (event: ToolResultEvent) => {
-		// Only text tool results matter — we can't meaningfully ask the LLM
-		// to summarise an empty result.
 		const tokens = estimateToolResultTokens(event.content);
-		if (tokens <= config.thresholdTokens) {
-			return; // below threshold — no marker needed
+		// No size threshold: every non-empty text result gets a marker so we
+		// can observe replacement behavior broadly. Empty results are skipped
+		// — there is nothing to distill.
+		if (tokens <= 0) {
+			return;
 		}
 
 		const contentString = flattenContent(event.content);
@@ -113,12 +117,10 @@ export default function toolclip(api: ExtensionAPI): void {
 		name: "replace_tool_result",
 		label: "Replace Tool Result",
 		description:
-			"Replace a long tool result with a tight summary. " +
-			"The replacement must be strictly shorter than the original and " +
-			"within the configured replacement ratio. " +
+			"Replace a tool result you have already read with a tight summary. " +
 			"You SHOULD call this for every [tool-result-pending-replacement: ...] marker " +
 			"as soon as you have extracted the relevant information. " +
-			"Do not defer replacement —the earlier you replace, the more context you save.",
+			"Do not defer replacement — the earlier you replace, the more context you save.",
 		promptSnippet:
 			"IMPORTANT: Call `replace_tool_result(toolCallId, replacement)` for every " +
 			"[tool-result-pending-replacement: ...] marker you see. " +
@@ -131,8 +133,9 @@ export default function toolclip(api: ExtensionAPI): void {
 			}),
 			replacement: Type.String({
 				description:
-					"Tight summary of the tool result. Must be strictly shorter " +
-					"than the original and within the max-replacement-ratio.",
+					"Tight summary of the tool result: the key numbers, paths, " +
+					"decisions, or excerpts you will need later — enough to answer " +
+					"future questions that depend on this result.",
 			}),
 		}),
 		async execute(
@@ -156,26 +159,12 @@ export default function toolclip(api: ExtensionAPI): void {
 			}
 
 			const replacementTokens = estimateTokens(params.replacement);
-			const gateResult = validateReplacement(
-				entry.originalTokens,
-				replacementTokens,
-				config.maxReplacementRatio,
-			);
 
-			if (!gateResult.ok) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: `Cannot replace: ${gateResult.reason}. ` +
-								`Either make a tighter summary or skip replacement entirely.`,
-						},
-					],
-					details: { ok: false, reason: gateResult.reason },
-				};
-			}
-
-			recordReplacement(state, params.toolCallId, params.replacement);
+			// No size gate: accept any replacement. Record a `grew` flag when the
+			// replacement is at least as large as the original — the observation
+			// target. If we see `grew: true` in real runs, that is the signal to
+			// reintroduce a length gate.
+			recordReplacement(state, params.toolCallId, params.replacement, replacementTokens);
 			return {
 				content: [
 					{
@@ -188,6 +177,7 @@ export default function toolclip(api: ExtensionAPI): void {
 					ok: true,
 					originalTokens: entry.originalTokens,
 					replacementTokens,
+					grew: replacementTokens >= entry.originalTokens,
 				},
 			};
 		},
@@ -217,8 +207,8 @@ export default function toolclip(api: ExtensionAPI): void {
 			"- Do NOT keep a result because you might quote it later. If you will reference a " +
 			"  specific excerpt, put that excerpt into the replacement now and replace the " +
 			"  whole result — do not park the full original for later quoting.\n" +
-			"- The replacement must be strictly shorter than the original and within the " +
-			"  configured ratio.\n" +
+			"- Keep the replacement tight: the point is to free context, so capture only " +
+			"  what you will actually need later.\n" +
 			"- The only valid reason to keep a marked result un-replaced is that you have not " +
 			"  yet read it. Once you have read it, replace it before moving on.\n";
 

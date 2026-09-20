@@ -10,15 +10,12 @@ The LLM is the only actor. There is no auto-summarizer and no auto-eviction. The
 
 ## What it does
 
-1. On the `tool_result` event, if `estimateTokens(content) > thresholdTokens`, append a marker to the LLM-facing content:
+1. On the `tool_result` event, append a marker to the LLM-facing content of every non-empty text tool result:
    ```
    [tool-result-pending-replacement: toolCallId=abc, tokens=1024]
    ```
-   The original content is **not** modified.
-2. The LLM can call `replace_tool_result(toolCallId, replacement)` at its leisure. The tool is gated by a length check:
-   - **Hard fail** — `replacement.tokens >= original.tokens`.
-   - **Soft fail** — `replacement.tokens > maxReplacementRatio × original.tokens`.
-   - On failure, the LLM gets the rule + actual token numbers, e.g. `"replacement is 49 tokens; original is 50; ratio 0.98 exceeds max 0.1"`.
+   The original content is **not** modified. (Size thresholds were removed so replacement behavior can be observed without pre-filtering — every non-empty result is marked.)
+2. The LLM can call `replace_tool_result(toolCallId, replacement)` at its leisure. **No length gate is applied** — replacements of any size are accepted. The tool records a `grew` flag (`replacementTokens >= originalTokens`) in its details so observers can detect replacements that bloat rather than shrink context. That flag is the signal for reintroducing a length gate later.
 3. On the `context` event (before each LLM call), any `ToolResultMessage` whose `toolCallId` has a stored replacement is swapped to:
    ```
    <replacement>
@@ -29,10 +26,7 @@ The LLM is the only actor. There is no auto-summarizer and no auto-eviction. The
 
 ## Configuration
 
-| Env var | Default | Meaning |
-|---|---|---|
-| `TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS` | `250` | Tool results above this estimated token count get the pending marker appended. |
-| `TOOLCLIP_MAX_REPLACEMENT_RATIO` | `0.1` | Soft-fail ceiling. Replacement must be at most `ratio × original` tokens. |
+No size-bound configuration is applied at present. Size thresholds (the marker token threshold and the max-replacement-ratio) were removed so replacement behavior can be observed without pre-filtering or gating — the bet being that we should confirm replacements actually bloat context before band-aiding a healthy finger. The config plumbing (`loadToolclipConfig`) and the `ToolclipConfig` interface remain in place so limits can be reintroduced once observation warrants.
 
 Token estimation uses `Math.ceil(text.length / 4)` (chars/4 heuristic).
 
@@ -43,8 +37,9 @@ Sesclip compacts the **entire** session context when it crosses a threshold. Too
 ## Out of scope (deferred)
 
 - Retrieval tools (`get_tool_result`, `grep_tool_result`, pagination).
-- Real tokenizer dependency (chars/4 is good enough for threshold and gate decisions).
+- Real tokenizer dependency (chars/4 is good enough for token estimates).
 - Auto-summarization at `tool_result` time (would lose fidelity — the LLM must see the original first).
+- Size gates on replacements (removed for observation; reintroduce once we see `grew: true` in real runs).
 
 ## Develop
 

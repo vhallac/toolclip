@@ -67,7 +67,7 @@ describe("recordReplacement", () => {
 	it("stores the replacement on an existing pending entry", () => {
 		const state = createRuntimeState();
 		recordPending(state, "abc", 500, "the original payload");
-		const stored = recordReplacement(state, "abc", "tight summary");
+		const stored = recordReplacement(state, "abc", "tight summary", 3);
 		expect(stored).toBe(true);
 		expect(getReplacement(state, "abc")).toBe("tight summary");
 	});
@@ -76,14 +76,14 @@ describe("recordReplacement", () => {
 		const state = createRuntimeState();
 		recordPending(state, "abc", 500, "x");
 		expect(pendingIds(state)).toEqual(["abc"]);
-		recordReplacement(state, "abc", "tight");
+		recordReplacement(state, "abc", "tight", 3);
 		expect(pendingIds(state)).toEqual([]);
 		expect(replacedIds(state)).toEqual(["abc"]);
 	});
 
 	it("is a no-op for an unknown id and returns false", () => {
 		const state = createRuntimeState();
-		const stored = recordReplacement(state, "never-recorded", "tight");
+		const stored = recordReplacement(state, "never-recorded", "tight", 3);
 		expect(stored).toBe(false);
 		expect(getEntry(state, "never-recorded")).toBeUndefined();
 		expect(pendingIds(state)).toEqual([]);
@@ -93,19 +93,44 @@ describe("recordReplacement", () => {
 	it("preserves originalTokens and originalContent when replacing", () => {
 		const state = createRuntimeState();
 		recordPending(state, "abc", 500, "the full original");
-		recordReplacement(state, "abc", "tight");
+		recordReplacement(state, "abc", "tight", 3);
 		const entry = getEntry(state, "abc");
 		expect(entry?.originalTokens).toBe(500);
 		expect(entry?.originalContent).toBe("the full original");
 		expect(entry?.replacement).toBe("tight");
 	});
 
+	it("records replacementTokens and sets grew=false when smaller than original", () => {
+		const state = createRuntimeState();
+		recordPending(state, "abc", 500, "x");
+		recordReplacement(state, "abc", "tight", 3);
+		const entry = getEntry(state, "abc");
+		expect(entry?.replacementTokens).toBe(3);
+		expect(entry?.grew).toBe(false);
+	});
+
+	it("sets grew=true when replacement is at least as large as original", () => {
+		const state = createRuntimeState();
+		recordPending(state, "abc", 500, "x");
+		// replacement >= original → grew flag set (observation target)
+		recordReplacement(state, "abc", "x".repeat(2000), 500);
+		expect(getEntry(state, "abc")?.grew).toBe(true);
+	});
+
+	it("sets grew=true when replacement exactly equals original tokens", () => {
+		const state = createRuntimeState();
+		recordPending(state, "abc", 500, "x");
+		recordReplacement(state, "abc", "same size", 500);
+		expect(getEntry(state, "abc")?.grew).toBe(true);
+	});
+
 	it("can be applied multiple times — latest replacement wins", () => {
 		const state = createRuntimeState();
 		recordPending(state, "abc", 500, "x");
-		recordReplacement(state, "abc", "first");
-		recordReplacement(state, "abc", "second");
+		recordReplacement(state, "abc", "first", 5);
+		recordReplacement(state, "abc", "second", 6);
 		expect(getReplacement(state, "abc")).toBe("second");
+		expect(getEntry(state, "abc")?.replacementTokens).toBe(6);
 	});
 });
 
@@ -124,7 +149,7 @@ describe("getReplacement", () => {
 	it("returns the stored replacement for a replaced entry", () => {
 		const state = createRuntimeState();
 		recordPending(state, "abc", 500, "x");
-		recordReplacement(state, "abc", "tight");
+		recordReplacement(state, "abc", "tight", 3);
 		expect(getReplacement(state, "abc")).toBe("tight");
 	});
 });
@@ -134,7 +159,7 @@ describe("clear", () => {
 		const state = createRuntimeState();
 		recordPending(state, "a", 1, "A");
 		recordPending(state, "b", 2, "B");
-		recordReplacement(state, "a", "ta");
+		recordReplacement(state, "a", "ta", 1);
 		clear(state);
 		expect(state.entries.size).toBe(0);
 		expect(pendingIds(state)).toEqual([]);

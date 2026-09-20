@@ -6,11 +6,12 @@ import { createMockApi, invokeHandler, invokeTool } from "./_helpers/mock-pi.ts"
 // tool_result event handler tests
 // -----------------------------------------------------------------------
 describe("tool_result handler", () => {
-	it("appends a pending marker when result exceeds threshold (default 250 tokens)", () => {
+	it("appends a pending marker to every non-empty text result", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 
-		const longText = "x".repeat(1001); // 1001/4 = ceil(250.25) = 251 > 250
+		// No size threshold: any non-empty text result gets a marker.
+		const longText = "x".repeat(1001); // 1001/4 = ceil(250.25) = 251 tokens
 		const result = invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "read-1",
@@ -31,11 +32,11 @@ describe("tool_result handler", () => {
 		);
 	});
 
-	it("does NOT append a marker when result is below threshold", () => {
+	it("appends a marker even to a short result (no threshold)", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 
-		const shortText = "x".repeat(500); // 500/4 = 125 ≤ 250
+		const shortText = "x".repeat(500); // 500/4 = 125 tokens
 		const result = invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "read-2",
@@ -44,7 +45,10 @@ describe("tool_result handler", () => {
 			isError: false,
 		});
 
-		expect(result).toBeUndefined();
+		expect(result).toBeDefined();
+		const content = (result as { content: Array<{ type: string; text: string }> }).content;
+		expect(content).toHaveLength(2);
+		expect(content[1].text).toContain("tokens=125");
 	});
 
 	it("does NOT append a marker for an empty result (0 tokens)", () => {
@@ -68,7 +72,7 @@ describe("tool_result handler", () => {
 
 		const block1 = "x".repeat(600);  // 150 tokens
 		const block2 = "y".repeat(604);  // 151 tokens
-		// Total: 301 tokens > 250
+		// Total: 301 tokens
 		const result = invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "multi-1",
@@ -86,7 +90,7 @@ describe("tool_result handler", () => {
 		expect(content[2].text).toContain("tokens=301");
 	});
 
-	it("ignores image blocks in token count (short text stays below threshold)", () => {
+	it("appends a marker when the only text is short but present (image blocks ignored)", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 
@@ -101,7 +105,25 @@ describe("tool_result handler", () => {
 			isError: false,
 		});
 
-		// 16 chars / 4 = 4 tokens → below 250
+		// 17 chars / 4 = ceil(4.25) = 5 tokens — non-zero, so marker is appended.
+		expect(result).toBeDefined();
+		const content = (result as { content: Array<{ type: string; text: string }> }).content;
+		expect(content[2].text).toContain("tokens=5");
+	});
+
+	it("does not append a marker when content has only an image and no text", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+
+		const result = invokeHandler(handlers, "tool_result", {
+			type: "tool_result",
+			toolCallId: "img-only",
+			toolName: "read",
+			content: [{ type: "image", mimeType: "image/png", data: "abc123" }],
+			isError: false,
+		});
+
+		// 0 text tokens → nothing to distill → no marker.
 		expect(result).toBeUndefined();
 	});
 
@@ -129,11 +151,11 @@ describe("tool_result handler", () => {
 // replace_tool_result tool tests
 // -----------------------------------------------------------------------
 describe("replace_tool_result tool", () => {
-	it("accepts a valid replacement that passes both gates", async () => {
+	it("accepts a replacement shorter than the original (grew=false)", async () => {
 		const { handlers, pi, tools } = createMockApi();
 		toolclip(pi as never);
 
-		// Emit a long tool result to create a pending entry
+		// Emit a tool result to create a pending entry
 		invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "tool-1",
@@ -150,32 +172,38 @@ describe("replace_tool_result tool", () => {
 		expect(result.details).toMatchObject({ ok: true });
 		expect(result.details.originalTokens).toBe(500);
 		expect(result.details.replacementTokens).toBe(4);
+		expect(result.details.grew).toBe(false);
 	});
 
-	it("rejects replacement that is longer than original (hard fail)", async () => {
+	it("accepts a replacement longer than the original (no gate) and flags grew=true", async () => {
+		// Size thresholds removed: a replacement larger than the original is
+		// accepted. The `grew` flag is the observation target — if we see it
+		// true in real runs, that is the signal to reintroduce a gate.
 		const { handlers, pi, tools } = createMockApi();
 		toolclip(pi as never);
 
-		// 1200 chars / 4 = 300 tokens > 250 threshold, so entry is recorded
+		// 1200 chars / 4 = 300 tokens
 		invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
-			toolCallId: "tool-hard",
+			toolCallId: "tool-grew",
 			toolName: "bash",
 			content: [{ type: "text", text: "x".repeat(1200) }],
 			isError: false,
 		});
 
-		// 1300 chars / 4 = 325 tokens > 300 original
-		const result = (await invokeTool(tools, "replace_tool_result", "tool-hard", {
-			toolCallId: "tool-hard",
+		// 1300 chars / 4 = 325 tokens > 300 original — previously hard-failed.
+		const result = (await invokeTool(tools, "replace_tool_result", "tool-grew", {
+			toolCallId: "tool-grew",
 			replacement: "x".repeat(1300),
 		})) as { details: Record<string, unknown> };
 
-		expect(result.details).toMatchObject({ ok: false });
-		expect(result.details.reason).toContain("must be strictly shorter");
+		expect(result.details).toMatchObject({ ok: true });
+		expect(result.details.originalTokens).toBe(300);
+		expect(result.details.replacementTokens).toBe(325);
+		expect(result.details.grew).toBe(true);
 	});
 
-	it("rejects replacement that exceeds the soft-fail ratio (soft fail)", async () => {
+	it("accepts a replacement that previously would have soft-failed the ratio", async () => {
 		const { handlers, pi, tools } = createMockApi();
 		toolclip(pi as never);
 
@@ -187,13 +215,14 @@ describe("replace_tool_result tool", () => {
 			isError: false,
 		});
 
+		// 500 chars / 4 = 125 tokens vs 1000 original → ratio 0.125, previously
+		// rejected by the 0.1 soft-fail ceiling. Now accepted.
 		const result = (await invokeTool(tools, "replace_tool_result", "tool-soft", {
 			toolCallId: "tool-soft",
 			replacement: "y".repeat(500),
 		})) as { details: Record<string, unknown> };
 
-		expect(result.details).toMatchObject({ ok: false });
-		expect(result.details.reason).toContain("exceeds the maximum allowed fraction");
+		expect(result.details).toMatchObject({ ok: true, grew: false });
 	});
 
 	it("returns error for unknown toolCallId", async () => {
@@ -235,7 +264,7 @@ describe("replace_tool_result tool", () => {
 		expect(res2.details.replacementTokens).toBe(1);
 	});
 
-	it("handles zero-length replacement (0 tokens — trivially passes)", async () => {
+	it("handles zero-length replacement (0 tokens)", async () => {
 		const { handlers, pi, tools } = createMockApi();
 		toolclip(pi as never);
 
@@ -252,7 +281,7 @@ describe("replace_tool_result tool", () => {
 			replacement: "",
 		})) as { details: Record<string, unknown> };
 
-		expect(result.details).toMatchObject({ ok: true });
+		expect(result.details).toMatchObject({ ok: true, grew: false });
 	});
 });
 
@@ -405,10 +434,10 @@ describe("before_agent_start handler", () => {
 		expect(result.systemPrompt).toContain(
 			"Do not let size become a reason to keep the full original around",
 		);
-		expect(result.systemPrompt).toContain(
-			"The replacement must be strictly shorter than the original",
-		);
 		expect(result.systemPrompt).toContain("replace it before moving on");
+		// Size-gate language was removed — these phrases must NOT appear.
+		expect(result.systemPrompt).not.toContain("strictly shorter than the original");
+		expect(result.systemPrompt).not.toContain("configured ratio");
 	});
 
 	it("appends to an empty system prompt", () => {

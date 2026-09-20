@@ -12,8 +12,8 @@ Sesclip compacts the **entire** session context when it crosses a threshold. Too
 
 The extension lives at `src/toolclip.ts` and follows the Semblr split: a thin pi extension entrypoint in `src/`, reusable logic in `lib/`. It:
 
-- Listens to the `tool_result` event; when a result exceeds the token threshold, appends a `[tool-result-pending-replacement: toolCallId=id, tokens=N]` marker to the LLM-facing content (the original stays intact).
-- Registers a `replace_tool_result(toolCallId, replacement)` tool the LLM can call at its leisure. The call is gated by a hard-fail / soft-fail length check (replacement must be strictly shorter than the original, and within `maxReplacementRatio × original`).
+- Listens to the `tool_result` event; appends a `[tool-result-pending-replacement: toolCallId=id, tokens=N]` marker to the LLM-facing content of every non-empty text result (the original stays intact). Size thresholds were removed so replacement behavior can be observed without pre-filtering.
+- Registers a `replace_tool_result(toolCallId, replacement)` tool the LLM can call at its leisure. **No length gate is applied** — replacements of any size are accepted, and the tool records a `grew` flag (`replacementTokens >= originalTokens`) in its details as the observation target for reintroducing a gate later.
 - Listens to the `context` event; before each LLM call, swaps any `ToolResultMessage` whose `toolCallId` has a stored replacement to `[replacement]\n[tool-result-replaced: toolCallId=id]`. This is the cache-break point — known and accepted.
 - Injects system-prompt instructions explaining the marker and the tool. If the LLM never calls the tool, the original result stays.
 
@@ -22,7 +22,7 @@ The extension lives at `src/toolclip.ts` and follows the Semblr split: a thin pi
 - `README.md` — overview, limits, usage, behavior
 - `AGENTS.md` — this file
 - `src/toolclip.ts` — thin extension entrypoint
-- `lib/` — config, token estimator, marker, runtime state, length gate, shared types
+- `lib/` — config, token estimator, marker, runtime state, shared types
 - `tests/` — unit and integration tests
 - `eval/` — golden-spec runners and runs (mirrors sesclip)
 - `doc/` — design notes, prompt contracts, architecture
@@ -31,10 +31,7 @@ The extension lives at `src/toolclip.ts` and follows the Semblr split: a thin pi
 
 ## Configuration
 
-| Env var | Default | Meaning |
-|---|---|---|
-| `TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS` | `250` | Tool results above this estimated token count get the pending marker appended. |
-| `TOOLCLIP_MAX_REPLACEMENT_RATIO` | `0.1` | Soft-fail ceiling. Replacement must be at most `ratio × original` tokens. Hard-fail ceiling is `1.0` (replacement must be strictly shorter than original). |
+No size-bound configuration is applied at present. Size thresholds (the marker token threshold and the max-replacement-ratio) were removed so replacement behavior can be observed without pre-filtering or gating — the bet being that we should confirm replacements actually bloat context before band-aiding a healthy finger. The config plumbing (`loadToolclipConfig`) and the `ToolclipConfig` interface remain so limits can be reintroduced once observation warrants.
 
 Token estimation uses `Math.ceil(text.length / 4)` (chars/4 heuristic, same as sesclip).
 
@@ -55,9 +52,9 @@ For implementation tasks, use code-and-test-together development.
 - Keep `src/toolclip.ts` thin; move policy and logic into `lib/`.
 - The LLM is the only actor that can mark a result for replacement.
 - The LLM must see the original tool result at least once before any replacement.
-- The length gate is strict: hard fail (replacement ≥ original) AND soft fail (replacement > ratio × original).
 - The marker is appended, not destructive.
 - After swap, the replaced content keeps a `[tool-result-replaced: id]` marker for traceability.
+- Size thresholds are currently removed for observation. Replacements of any size are accepted; the tool records a `grew` flag (`replacementTokens >= originalTokens`) in its details. `grew: true` in real runs is the signal to reintroduce a length gate — do not add one speculatively.
 - Verify with real commands before claiming completion.
 
 ## Attributions

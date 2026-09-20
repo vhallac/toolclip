@@ -52,9 +52,16 @@ export function recordPending(
  * can only target a tool result the LLM has already seen, so a stray id
  * is silently ignored.
  *
+ * No size gating is applied: the replacement is accepted regardless of its
+ * length relative to the original. The entry records the replacement's
+ * estimated token count and a `grew` flag (true when replacementTokens >=
+ * originalTokens) so observers can detect replacements that bloat context
+ * rather than shrink it — the signal for reintroducing a gate later.
+ *
  * @param state - The runtime state to mutate.
  * @param toolCallId - The tool call id.
- * @param replacement - The LLM-supplied tight replacement text.
+ * @param replacement - The LLM-supplied replacement text.
+ * @param replacementTokens - Estimated token count of the replacement.
  * @returns `true` if the replacement was stored, `false` if there was no
  *          pending entry for that id.
  */
@@ -62,12 +69,15 @@ export function recordReplacement(
 	state: ToolclipRuntimeState,
 	toolCallId: string,
 	replacement: string,
+	replacementTokens: number,
 ): boolean {
 	const entry = state.entries.get(toolCallId);
 	if (!entry) {
 		return false;
 	}
 	entry.replacement = replacement;
+	entry.replacementTokens = replacementTokens;
+	entry.grew = replacementTokens >= entry.originalTokens;
 	return true;
 }
 

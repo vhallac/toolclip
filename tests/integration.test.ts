@@ -15,7 +15,7 @@ import { describe, expect, it } from "vitest";
 import toolclip from "../src/toolclip.ts";
 import { createMockApi, invokeHandler, invokeTool } from "./_helpers/mock-pi.ts";
 
-const LONG_TEXT = "x".repeat(2000); // 500 tokens, exceeds default 250 threshold
+const LONG_TEXT = "x".repeat(2000); // 500 tokens
 
 describe("toolclip — smoke integration", () => {
 	it("drives the full flow: marker → replace → swap on next context", async () => {
@@ -102,15 +102,11 @@ describe("toolclip — smoke integration", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 
-		// Short tool result — no marker appended, no entry recorded.
-		invokeHandler(handlers, "tool_result", {
-			type: "tool_result",
-			toolCallId: "short-1",
-			toolName: "bash",
-			content: [{ type: "text", text: "ok" }],
-			isError: false,
-		});
-
+		// A tool result with no replacement recorded stays in place. (With the
+		// threshold removed, even a short result gets a marker at tool_result
+		// time — but this test fires `context` directly without first emitting
+		// a tool_result event, so no pending entry exists and the message is
+		// untouched.)
 		const event = {
 			type: "context",
 			messages: [
@@ -210,14 +206,14 @@ describe("toolclip — smoke integration", () => {
 			replacement: "tight summary",
 		});
 
-		// 3. Short result → no entry.
-		invokeHandler(handlers, "tool_result", {
+		// 3. Short result → pending entry (threshold removed) but NOT replaced.
+		const shortResult = invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "short-1",
 			toolName: "bash",
 			content: [{ type: "text", text: "ok" }],
 			isError: false,
-		});
+		}) as { content: Array<{ type: string; text: string }> };
 
 		// All three appear in the next context event.
 		const event = {
@@ -241,7 +237,7 @@ describe("toolclip — smoke integration", () => {
 					role: "toolResult",
 					toolCallId: "short-1",
 					toolName: "bash",
-					content: [{ type: "text", text: "ok" }],
+					content: shortResult.content,
 					isError: false,
 				},
 			],
@@ -261,8 +257,8 @@ describe("toolclip — smoke integration", () => {
 			"[tool-result-replaced: toolCallId=replaced-1]",
 		);
 
-		// Short → untouched (below threshold, no marker, no entry).
-		expect(result.messages[2].content).toHaveLength(1);
-		expect(result.messages[2].content[0].text).toBe("ok");
+		// Short → pending but not replaced, so marker stays (no swap).
+		expect(result.messages[2].content).toHaveLength(2);
+		expect(result.messages[2].content[1].text).toContain("tool-result-pending-replacement");
 	});
 });
