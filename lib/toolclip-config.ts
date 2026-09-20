@@ -8,12 +8,19 @@ import type { ToolclipConfig } from "./types.ts";
 const DEFAULT_TOOL_RESULT_THRESHOLD_TOKENS = 1000;
 
 /**
- * Default band size for the count-based steering reminder. The reminder
- * fires when the number of un-replaced pending results first reaches each
- * multiple of this value (5–9, 10–14, ...), and re-arms when the count
- * drops back below the announced band — so a re-grown pile is nagged again.
+ * Default pending-count threshold for the steering reminder: it fires when
+ * the number of un-replaced pending results strictly exceeds this value,
+ * and re-arms when the count falls back to it or below.
  */
-const DEFAULT_STEERING_REMINDER_MULTIPLE = 5;
+const DEFAULT_STEERING_COUNT_THRESHOLD = 5;
+
+/**
+ * Default total-size threshold (estimated tokens) for the steering
+ * reminder: it fires when the un-replaced pending pile strictly exceeds
+ * this, and re-arms when the total falls back to it or below. Catches the
+ * single-huge-item case the count trigger is blind to (count = 1).
+ */
+const DEFAULT_STEERING_SIZE_THRESHOLD_TOKENS = 5000;
 
 /**
  * Default minimum token count for a tool result to be quarantined. Well
@@ -53,11 +60,16 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
  * a replacement grew larger than its original (the observation target); no
  * rejection happens.
  *
- * The steering reminder is a trailing user message injected when the number
- * of un-replaced pending results first reaches each multiple of
- * `steeringReminderMultiple` (default 5), listing the pending ids. It is
- * cache-safe — it is appended to the *end* of the context (a new user
- * block), so the cached prefix is never touched.
+ * The steering reminder is a trailing user message injected when either
+ * steering trigger fires: the number of un-replaced pending results strictly
+ * exceeds `steeringCountThreshold` (default 5), or their total estimated
+ * size strictly exceeds `steeringSizeThresholdTokens` (default 5000). Each
+ * trigger nags once per excursion (its latch re-arms when its condition
+ * falls back to the threshold), and the two latches are independent — one
+ * trigger's fire never suppresses the other's. The reminder lists the
+ * pending ids with their sizes. It is cache-safe — it is appended to the
+ * *end* of the context (a new user block), so the cached prefix is never
+ * touched.
  *
  * Quarantine: results above `quarantineThresholdTokens` (default 10000) are
  * withheld from the LLM entirely — the content is swapped for a notice and
@@ -72,9 +84,13 @@ export function loadToolclipConfig(env: NodeJS.ProcessEnv = process.env): Toolcl
 			DEFAULT_TOOL_RESULT_THRESHOLD_TOKENS,
 		),
 		steeringReminder: parseBool(env.TOOLCLIP_STEERING_REMINDER, true),
-		steeringReminderMultiple: parsePositiveInt(
-			env.TOOLCLIP_STEERING_REMINDER_MULTIPLE,
-			DEFAULT_STEERING_REMINDER_MULTIPLE,
+		steeringCountThreshold: parsePositiveInt(
+			env.TOOLCLIP_STEERING_COUNT_THRESHOLD,
+			DEFAULT_STEERING_COUNT_THRESHOLD,
+		),
+		steeringSizeThresholdTokens: parsePositiveInt(
+			env.TOOLCLIP_STEERING_SIZE_THRESHOLD_TOKENS,
+			DEFAULT_STEERING_SIZE_THRESHOLD_TOKENS,
 		),
 		quarantine: parseBool(env.TOOLCLIP_QUARANTINE, true),
 		quarantineThresholdTokens: parsePositiveInt(

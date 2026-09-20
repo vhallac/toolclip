@@ -74,8 +74,8 @@ import {
 import {
 	createSteeringState,
 	resetSteering,
-	unreplacedPendingIds,
-	observePendingBand,
+	pendingSummary,
+	observePendingSteering,
 	buildSteeringMessage,
 } from "../lib/steering.ts";
 import {
@@ -476,9 +476,9 @@ export default function toolclip(api: ExtensionAPI): void {
 	//    into the system prompt
 	// -----------------------------------------------------------------------
 	api.on("before_agent_start", (event: BeforeAgentStartEvent) => {
-		// New round: reset the steering band so a pending pile persisting into
-		// this round is re-announced on its first LLM call, and restart the
-		// per-round re-read counter.
+		// New round: reset the steering latches so a pending pile persisting
+		// into this round is re-announced on that round's first LLM call, and
+		// restart the per-round re-read counter.
 		resetSteering(steering);
 		resetRereads(state.readsThisRound);
 
@@ -545,8 +545,11 @@ export default function toolclip(api: ExtensionAPI): void {
 
 	// -----------------------------------------------------------------------
 	// 4. context event handler — swap replaced results before each LLM call,
-	//    and append a trailing steering reminder when the pending count has
-	//    entered a new multiple of `steeringReminderMultiple` (default 5).
+	//    and append a trailing steering reminder when either steering trigger
+	//    fires: the pending count strictly exceeds `steeringCountThreshold`
+	//    (default 5), or the pile's total estimated tokens strictly exceed
+	//    `steeringSizeThresholdTokens` (default 5000). Each trigger nags once
+	//    per excursion (independent latches; see lib/steering.ts).
 	//
 	//    The reminder is appended as a NEW trailing user message — pi's
 	//    standard steering path. It touches only the tail; the cached prefix
@@ -571,17 +574,35 @@ export default function toolclip(api: ExtensionAPI): void {
 			};
 		});
 
-		// Steering reminder: count-based. Observe the pending count first —
-		// it fires when the count first reaches each multiple of the band size
-		// (5–9, 10–14, ...), and re-arms when the count drops back below the
-		// announced band. The reminder lands LAST in the returned messages so
-		// it is the freshest context the model sees — and the prefix up to it
-		// stays cached.
-		const pendingIds = unreplacedPendingIds(state);
-		if (observePendingBand(steering, pendingIds.length, config.steeringReminderMultiple, config.steeringReminder)) {
+		// Steering reminder: count + size triggers. Observe the pending pile
+		// first — the count trigger fires when the count strictly exceeds its
+		// threshold, the size trigger when the pile's total estimated tokens
+		// strictly exceed theirs; each latches until its condition falls back
+		// to (or below) the threshold, and the latches are independent (a
+		// single huge item with count = 1 is caught by the size trigger — the
+		// count trigger is blind to it). The reminder lands LAST in the
+		// returned messages so it is the freshest context the model sees —
+		// and the prefix up to it stays cached.
+		const pending = pendingSummary(state);
+		const triggers = observePendingSteering(
+			steering,
+			pending.items.length,
+			pending.totalTokens,
+			{
+				countThreshold: config.steeringCountThreshold,
+				sizeThresholdTokens: config.steeringSizeThresholdTokens,
+				enabled: config.steeringReminder,
+			},
+		);
+		if (triggers.count || triggers.size) {
 			modified.push({
 				role: "user" as const,
-				content: [{ type: "text" as const, text: buildSteeringMessage(pendingIds.length, pendingIds) }],
+				content: [
+					{
+						type: "text" as const,
+						text: buildSteeringMessage(pending.items.length, pending.totalTokens, pending.items),
+					},
+				],
 				timestamp: Date.now(),
 			});
 		}

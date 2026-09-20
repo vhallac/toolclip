@@ -5,17 +5,31 @@
  * markers but never circles back to call `replace_tool_result` — it *collects*
  * pending replacements, deferring "until I need this" and then never does.
  *
- * The steering is count-based, not turn-based: it fires when the number of
- * un-replaced pending results enters a new multiple of `multiple` (default 5:
- * 5–9, 10–14, 15–19, ...). A growing pile is therefore nagged repeatedly —
- * once per band — instead of once per round, which is what the observed
- * failure needs: the turn-based reminder fired once and the pile kept growing
- * in silence afterwards.
+ * Two independent triggers, each edge-triggered with its own latch ("once
+ * per excursion"):
  *
- * Re-arming: when the count drops below the announced band (the agent acted),
- * the band follows it down silently. A pile that is later re-grown past the
- * next band crossing gets a fresh reminder. Without this, a pile announced at
- * 10 that was partially replaced and re-grown to 9 would stay un-nagged.
+ * - **count**: the number of un-replaced pending results strictly exceeds
+ *   `countThreshold` (default 5). Fires once when the pile crosses the
+ *   threshold; the latch re-arms when the count falls back to the threshold
+ *   or below — so a pile that is partially replaced and then re-grown is
+ *   nagged again, while one that stays above the threshold is not re-nagged
+ *   on every LLM call.
+ * - **size**: the total estimated tokens of un-replaced pending results
+ *   strictly exceeds `sizeThresholdTokens` (default 5000). This catches
+ *   what the count trigger is structurally blind to: a single huge un-
+ *   replaced result never exceeds a count of 5 — the 2026-09-20 golden run
+ *   left a ~30k-token base64 blob pending for 24 calls with no nag at all.
+ *
+ * The latches are independent on purpose. A single shared latch would let
+ * one trigger's fire mask the other's later crossing: the count nag fires,
+ * the pile is distilled down to one huge item, and the size trigger — the
+ * only one that can still catch it — would stay suppressed. With separate
+ * latches, each threshold nags once per excursion above it, and a nag for
+ * one trigger never silences the other.
+ *
+ * Round boundary: state resets at each round boundary (in
+ * `before_agent_start`) so a pile persisting into a new round is re-announced
+ * on that round's first LLM call.
  *
  * Cache safety: the reminder is appended to the *end* of the context as a new
  * `user` message. Pi's standard steering path does exactly this — a user
@@ -34,20 +48,45 @@ import type { ToolclipRuntimeState } from "./types.ts";
  * `before_agent_start`) so a pile persisting into a new round is re-announced
  * on that round's first LLM call.
  *
- * `announcedBand` is the highest pending-count band (in units of `multiple`)
- * already announced this round. Band `k` covers counts `[k*multiple,
- * (k+1)*multiple)`. A band is announced when the count first enters it.
+ * Each latch is true once its trigger has fired for the current excursion
+ * above its threshold; both re-arm when their condition falls back to (or
+ * below) the threshold. The latches are independent: a fire of one trigger
+ * never suppresses the other.
  */
 export interface SteeringState {
-	/** Highest pending-count band already announced this round. */
-	announcedBand: number;
+	/** True once the count trigger has fired for the current excursion. */
+	countLatched: boolean;
+	/** True once the size trigger has fired for the current excursion. */
+	sizeLatched: boolean;
+}
+
+/** Options for the steering eligibility decision (from `ToolclipConfig`). */
+export interface SteeringOptions {
+	/** Nag when the pending count strictly exceeds this. */
+	countThreshold: number;
+	/** Nag when the total pending estimated tokens strictly exceed this. */
+	sizeThresholdTokens: number;
+	/** Master switch; when false nothing fires and no latch is tracked. */
+	enabled: boolean;
+}
+
+/** Which triggers fired on this observation (at most one message is sent). */
+export interface SteeringTriggers {
+	count: boolean;
+	size: boolean;
+}
+
+/** One un-replaced pending result: its id and original estimated tokens. */
+export interface PendingItem {
+	id: string;
+	tokens: number;
 }
 
 /**
  * Create fresh steering state for a new round.
  */
 export function createSteeringState(): SteeringState {
-	return { announcedBand: 0 };
+	return { countLatched: false, sizeLatched: false };
 }
 
 /**
@@ -56,7 +95,27 @@ export function createSteeringState(): SteeringState {
  * object survives across rounds without re-allocation.
  */
 export function resetSteering(state: SteeringState): void {
-	state.announcedBand = 0;
+	state.countLatched = false;
+	state.sizeLatched = false;
+}
+
+/**
+ * Summarize the un-replaced pending results: ids in insertion order with
+ * their original estimated token counts, plus the total.
+ */
+export function pendingSummary(rt: ToolclipRuntimeState): {
+	items: PendingItem[];
+	totalTokens: number;
+} {
+	const items: PendingItem[] = [];
+	let totalTokens = 0;
+	for (const [id, entry] of rt.entries) {
+		if (entry.replacement === undefined) {
+			items.push({ id, tokens: entry.originalTokens });
+			totalTokens += entry.originalTokens;
+		}
+	}
+	return { items, totalTokens };
 }
 
 /**
@@ -65,66 +124,76 @@ export function resetSteering(state: SteeringState): void {
  * pending results is `ids.length`.
  */
 export function unreplacedPendingIds(rt: ToolclipRuntimeState): string[] {
-	const ids: string[] = [];
-	for (const [id, entry] of rt.entries) {
-		if (entry.replacement === undefined) {
-			ids.push(id);
-		}
-	}
-	return ids;
+	return pendingSummary(rt).items.map((item) => item.id);
 }
 
 /**
- * Observe the current pending count and decide whether a steering reminder
+ * Observe the current pending pile and decide whether a steering reminder
  * should fire on this LLM call.
  *
- * Band `k = floor(count / multiple)`. Fires exactly when the count enters a
- * band strictly above the announced one — i.e. once per band crossing. When
- * the count drops below the announced band (the agent replaced results), the
- * band follows it down silently: a later re-grown pile is nagged again.
- *
- * Mutates `state.announcedBand` (the tracked band). Returns whether to fire.
- * With `enabled` false, nothing ever fires and the band is not tracked.
+ * Each trigger is edge-triggered with its own latch: it fires exactly when
+ * its condition first becomes true (strictly above the threshold) and latches
+ * until the condition falls back to the threshold or below. Mutates
+ * `state.countLatched` / `state.sizeLatched`. Returns which triggers fired —
+ * the caller sends at most one reminder per observation.
  */
-export function observePendingBand(
+export function observePendingSteering(
 	state: SteeringState,
 	count: number,
-	multiple: number,
-	enabled: boolean,
-): boolean {
-	if (!enabled) {
-		return false;
+	totalTokens: number,
+	options: SteeringOptions,
+): SteeringTriggers {
+	if (!options.enabled) {
+		return { count: false, size: false };
 	}
-	const band = Math.floor(count / multiple);
-	if (band > state.announcedBand) {
-		state.announcedBand = band;
-		return true;
+	// Re-arm on excursion end first, so the latch follows the pile down in
+	// the same observation that sees the drop (mirrors the re-arm semantics
+	// of the band ladder this replaced).
+	if (count <= options.countThreshold) {
+		state.countLatched = false;
 	}
-	if (band < state.announcedBand) {
-		state.announcedBand = band;
+	if (totalTokens <= options.sizeThresholdTokens) {
+		state.sizeLatched = false;
 	}
-	return false;
+	const triggers = { count: false, size: false };
+	if (count > options.countThreshold && !state.countLatched) {
+		state.countLatched = true;
+		triggers.count = true;
+	}
+	if (totalTokens > options.sizeThresholdTokens && !state.sizeLatched) {
+		state.sizeLatched = true;
+		triggers.size = true;
+	}
+	return triggers;
 }
 
 /**
- * Build the steering reminder text: a count summary, the extract-then-replace
- * method, the anti-hoarding rule ("do not save for just in case"), and the
- * explicit list of pending ids so the agent can act on them directly in a
- * single batched `replace_tool_result` call. Kept short and imperative.
+ * Build the steering reminder text: a count and total-size summary, the
+ * extract-then-replace method, the anti-hoarding rule ("do not save for just
+ * in case"), and the explicit list of pending ids with their sizes so the
+ * agent can act on them directly in a single batched `replace_tool_result`
+ * call — and can see at a glance which single item is hogging the pile.
+ * Kept short and imperative.
  *
  * @param count - How many marked results are still un-replaced.
- * @param ids - The pending tool-call ids, in the order reported.
+ * @param totalTokens - Total estimated tokens across the pending pile.
+ * @param items - The pending items (id + estimated tokens), in reported order.
  */
-export function buildSteeringMessage(count: number, ids: string[]): string {
+export function buildSteeringMessage(
+	count: number,
+	totalTokens: number,
+	items: PendingItem[],
+): string {
 	const lines = [
-		`Steering: you have ${count} tool-result-pending-replacements — consider distilling their results. ` +
+		`Steering: you have ${count} tool-result-pending-replacements totalling ~${totalTokens} estimated tokens — ` +
+			`consider distilling their results. ` +
 			`Extract ALL information you may still need from each into its replacement and replace them now, ` +
 			`in a single replace_tool_result call. Do not save a result for just in case: ` +
 			`anything you might need later belongs inside its replacement, and an un-replaced original ` +
 			`keeps costing full context on every call.`,
 	];
-	for (const id of ids) {
-		lines.push(`- ${id}`);
+	for (const item of items) {
+		lines.push(`- ${item.id} (~${item.tokens} tokens)`);
 	}
 	return lines.join("\n");
 }

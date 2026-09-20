@@ -23,19 +23,28 @@ export interface ToolclipConfig {
 	 */
 	toolResultThresholdTokens: number;
 	/**
-	 * Whether to inject count-band steering reminders when the agent has
-	 * left marked tool results un-replaced. Defaults to `true`. Gated by
+	 * Whether to inject steering reminders when the agent has left marked
+	 * tool results un-replaced. Defaults to `true`. Gated by
 	 * `TOOLCLIP_STEERING_REMINDER`.
 	 */
 	steeringReminder: boolean;
 	/**
-	 * Band size for the count-based steering reminder: it fires when the
-	 * number of un-replaced pending results first reaches each multiple of
-	 * this value (5–9, 10–14, ... for the default `5`), and re-arms when the
-	 * count drops back below the announced band. Defaults to `5`. Gated by
-	 * `TOOLCLIP_STEERING_REMINDER_MULTIPLE`.
+	 * Pending-count threshold for the steering reminder: it fires when the
+	 * number of un-replaced pending results strictly exceeds this value,
+	 * and re-arms when the count falls back to it or below (one nag per
+	 * excursion). Defaults to `5`. Gated by
+	 * `TOOLCLIP_STEERING_COUNT_THRESHOLD`.
 	 */
-	steeringReminderMultiple: number;
+	steeringCountThreshold: number;
+	/**
+	 * Total-size threshold (estimated tokens) for the steering reminder: it
+	 * fires when the un-replaced pending pile strictly exceeds this, and
+	 * re-arms when the total falls back to it or below. Independent of the
+	 * count trigger — it catches a single huge un-replaced result (count of
+	 * 1), which the count trigger is structurally blind to. Defaults to
+	 * `5000`. Gated by `TOOLCLIP_STEERING_SIZE_THRESHOLD_TOKENS`.
+	 */
+	steeringSizeThresholdTokens: number;
 	/**
 	 * Whether oversized tool results are quarantined (content swapped for a
 	 * notice, payload held for one turn). Defaults to `true`. Gated by

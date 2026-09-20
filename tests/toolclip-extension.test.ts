@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi, afterEach } from "vitest";
 import toolclip from "../src/toolclip.ts";
 import { createMockApi, invokeHandler, invokeTool } from "./_helpers/mock-pi.ts";
 import type { Handler } from "./_helpers/mock-pi.ts";
@@ -692,7 +692,11 @@ describe("context event handler", () => {
 // steering reminder tests (context handler)
 // -----------------------------------------------------------------------
 describe("steering reminder injection", () => {
-	const LONG = "x".repeat(9000); // above the 1000-token threshold
+	const LONG = "x".repeat(9000); // 5776 tokens estimated — above the 1000-token threshold
+
+	afterEach(() => {
+		vi.unstubAllEnvs();
+	});
 
 	// Helper: emit a tool_result to create a pending (un-replaced) entry.
 	function emitPending(handlers: Map<string, Handler[]>, toolCallId: string): void {
@@ -741,96 +745,154 @@ describe("steering reminder injection", () => {
 		}
 	});
 
-	it("does not inject while the count is below the band size", () => {
+	it("fires on the size trigger for a single huge pending result (count = 1)", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
-		for (const id of ["t-1", "t-2", "t-3", "t-4"]) {
-			emitPending(handlers, id);
-		}
+		emitPending(handlers, "huge-1");
 
-		// Band size is 5: four pendings never cross it, however often the
-		// context event fires.
-		for (let i = 0; i < 3; i++) {
-			const r = runContext(handlers, ["t-1", "t-2", "t-3", "t-4"]);
-			expect(r.messages).toHaveLength(4);
-		}
-	});
-
-	it("injects a trailing user reminder when the count reaches the band size", () => {
-		const { handlers, pi } = createMockApi();
-		toolclip(pi as never);
-		for (const id of ["t-1", "t-2", "t-3", "t-4", "t-5"]) {
-			emitPending(handlers, id);
-		}
-
-		const r = runContext(handlers, ["t-1", "t-2", "t-3", "t-4", "t-5"]);
-		expect(r.messages).toHaveLength(6);
-		expect(r.messages[5].role).toBe("user");
+		// One pending of ~5776 estimated tokens exceeds the 5000 size
+		// threshold while the count (1) is nowhere near the count threshold:
+		// the golden-run single-huge-blob case the count trigger is blind to.
+		const r = runContext(handlers, ["huge-1"]);
+		expect(r.messages).toHaveLength(2);
+		expect(r.messages[1].role).toBe("user");
 		const text = reminderText(r);
-		expect(text).toContain("5 tool-result-pending-replacements");
+		expect(text).toContain("1 tool-result-pending-replacements");
+		expect(text).toContain("totalling ~5776 estimated tokens");
+		expect(text).toContain("- huge-1 (~5776 tokens)");
 		expect(text).toContain("replace_tool_result");
 		expect(text).toContain("just in case");
-		for (const id of ["t-1", "t-2", "t-3", "t-4", "t-5"]) {
-			expect(text).toContain(`- ${id}`);
-		}
-		expect(typeof r.messages[5].timestamp).toBe("number");
+		expect(typeof r.messages[1].timestamp).toBe("number");
+
+		// Latched: no re-nag while the pile stays above the threshold.
+		const r2 = runContext(handlers, ["huge-1"]);
+		expect(r2.messages).toHaveLength(1);
 	});
 
-	it("does not fire twice within the same band, fires again at the next multiple", () => {
+	it("does not fire while the count is at or below the count threshold", () => {
+		// Raise the size threshold so the count trigger is isolated here.
+		vi.stubEnv("TOOLCLIP_STEERING_SIZE_THRESHOLD_TOKENS", "100000");
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+		for (const id of ["t-1", "t-2", "t-3", "t-4", "t-5"]) {
+			emitPending(handlers, id);
+		}
+
+		// The count trigger fires strictly above 5: five pendings never
+		// cross it, however often the context event fires.
+		for (let i = 0; i < 3; i++) {
+			const r = runContext(handlers, ["t-1", "t-2", "t-3", "t-4", "t-5"]);
+			expect(r.messages).toHaveLength(5);
+		}
+	});
+
+	it("count trigger fires once when the count exceeds the threshold, latched until it falls back", () => {
+		vi.stubEnv("TOOLCLIP_STEERING_SIZE_THRESHOLD_TOKENS", "100000");
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 		const ids = ["t-1", "t-2", "t-3", "t-4", "t-5"];
 		for (const id of ids) emitPending(handlers, id);
 
-		const r5 = runContext(handlers, ids);
-		expect(r5.messages).toHaveLength(6); // fires at 5
+		// The 6th pending crosses the count threshold.
+		emitPending(handlers, "t-6");
+		ids.push("t-6");
+		const r6 = runContext(handlers, ids);
+		expect(r6.messages).toHaveLength(ids.length + 1);
+		const text = reminderText(r6);
+		expect(text).toContain("6 tool-result-pending-replacements");
+		for (const id of ids) {
+			expect(text).toContain(`- ${id} (~5776 tokens)`);
+		}
 
-		// Grow the pile within the same band (6..9): no further reminders.
-		for (const id of ["t-6", "t-7", "t-8", "t-9"]) {
+		// Grow the pile further: latched, no further reminders.
+		for (const id of ["t-7", "t-8", "t-9"]) {
 			emitPending(handlers, id);
 			ids.push(id);
 			const r = runContext(handlers, ids);
 			expect(r.messages).toHaveLength(ids.length);
 		}
-
-		// Crossing into the 10-14 band fires again.
-		emitPending(handlers, "t-10");
-		ids.push("t-10");
-		const r10 = runContext(handlers, ids);
-		expect(r10.messages).toHaveLength(ids.length + 1);
-		expect(reminderText(r10)).toContain("10 tool-result-pending-replacements");
 	});
 
-	it("re-arms after the pile is replaced back down below the band", async () => {
+	it("count trigger re-arms after the pile is replaced back down to the threshold", async () => {
+		vi.stubEnv("TOOLCLIP_STEERING_SIZE_THRESHOLD_TOKENS", "100000");
 		const { handlers, pi, tools } = createMockApi();
 		toolclip(pi as never);
-		const ids = ["t-1", "t-2", "t-3", "t-4", "t-5"];
+		const ids = ["t-1", "t-2", "t-3", "t-4", "t-5", "t-6"];
 		for (const id of ids) emitPending(handlers, id);
-		const r5 = runContext(handlers, ids);
-		expect(r5.messages).toHaveLength(6); // fires at 5
+		const r6 = runContext(handlers, ids);
+		expect(r6.messages).toHaveLength(7); // fires at 6
 
-		// Replace three of them: count drops to 2, band follows down.
-		for (const id of ["t-1", "t-2", "t-3"]) {
+		// Replace four of them: count drops to 2, the latch re-arms.
+		for (const id of ["t-1", "t-2", "t-3", "t-4"]) {
 			await invokeTool(tools, "replace_tool_result", "llm-1", {
 				toolCallId: id,
 				replacement: "distilled",
 			});
 		}
-		const remaining = ids.filter((id) => !["t-1", "t-2", "t-3"].includes(id));
+		const remaining = ids.filter((id) => !["t-1", "t-2", "t-3", "t-4"].includes(id));
 		const r2 = runContext(handlers, remaining);
 		expect(r2.messages).toHaveLength(2); // no reminder at count 2
 
-		// Re-grow the pile to 5: the reminder fires again for the new set.
-		for (const id of ["t-6", "t-7", "t-8"]) {
+		// Re-grow the pile past the threshold: the reminder fires again.
+		for (const id of ["t-7", "t-8", "t-9", "t-10"]) {
 			emitPending(handlers, id);
 			remaining.push(id);
 		}
 		const rAgain = runContext(handlers, remaining);
 		expect(rAgain.messages).toHaveLength(remaining.length + 1);
 		const text = reminderText(rAgain);
-		expect(text).toContain("5 tool-result-pending-replacements");
-		expect(text).toContain("- t-8");
+		expect(text).toContain("6 tool-result-pending-replacements");
+		expect(text).toContain("- t-10 (~5776 tokens)");
 		expect(text).not.toContain("- t-1\n");
+	});
+
+	it("fires a single reminder when both triggers fire on the same observation", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+		const ids = ["t-1", "t-2", "t-3", "t-4", "t-5", "t-6"];
+		for (const id of ids) emitPending(handlers, id);
+
+		// 6 pendings x 5776 = 34,656 tokens: both the count (6 > 5) and the
+		// size (34,656 > 5000) triggers are true on the first observation —
+		// but only ONE reminder is appended.
+		const r = runContext(handlers, ids);
+		expect(r.messages).toHaveLength(ids.length + 1);
+		const text = reminderText(r);
+		expect(text).toContain("6 tool-result-pending-replacements");
+		expect(text).toContain("totalling ~34656 estimated tokens");
+	});
+
+	it("size trigger re-arms only after the pile falls back to the size threshold", async () => {
+		const { handlers, pi, tools } = createMockApi();
+		toolclip(pi as never);
+
+		// Two pendings: 11,552 total — size fires.
+		emitPending(handlers, "t-1");
+		emitPending(handlers, "t-2");
+		const r = runContext(handlers, ["t-1", "t-2"]);
+		expect(r.messages).toHaveLength(3);
+
+		// Replace one: total 5776 is still above 5000 — the latch holds.
+		await invokeTool(tools, "replace_tool_result", "llm-1", {
+			toolCallId: "t-1",
+			replacement: "distilled",
+		});
+		const r2 = runContext(handlers, ["t-2"]);
+		expect(r2.messages).toHaveLength(1); // no reminder
+
+		// Replace the other: total falls to 0 — the latch re-arms.
+		await invokeTool(tools, "replace_tool_result", "llm-1", {
+			toolCallId: "t-2",
+			replacement: "distilled",
+		});
+		const r3 = runContext(handlers, []);
+		expect(r3.messages).toHaveLength(0);
+
+		// A new huge pending fires again.
+		emitPending(handlers, "t-3");
+		const r4 = runContext(handlers, ["t-3"]);
+		expect(r4.messages).toHaveLength(2);
+		expect(reminderText(r4)).toContain("totalling ~5776 estimated tokens");
 	});
 
 	it("does not inject when all pending results have been replaced", async () => {
@@ -862,7 +924,7 @@ describe("steering reminder injection", () => {
 		const r1 = runContext(handlers, ids);
 		expect(r1.messages).toHaveLength(6);
 
-		// New round: before_agent_start resets the band.
+		// New round: before_agent_start resets the latches.
 		invokeHandler(handlers, "before_agent_start", {
 			type: "before_agent_start",
 			prompt: "next round",
@@ -880,7 +942,7 @@ describe("steering reminder injection", () => {
 	it("appends the reminder as the LAST message", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
-		const ids = ["t-1", "t-2", "t-3", "t-4", "t-5"];
+		const ids = ["t-1", "t-2"];
 		for (const id of ids) emitPending(handlers, id);
 
 		// A context event whose last message is an assistant message — the
@@ -899,8 +961,8 @@ describe("steering reminder injection", () => {
 			],
 		}) as { messages: Array<Record<string, unknown>> };
 
-		expect(result.messages).toHaveLength(7);
-		expect(result.messages[6].role).toBe("user");
+		expect(result.messages).toHaveLength(4);
+		expect(result.messages[3].role).toBe("user");
 	});
 });
 
