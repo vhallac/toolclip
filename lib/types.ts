@@ -8,7 +8,19 @@
  * observed behavior.
  */
 export interface ToolclipConfig {
-	// intentionally empty — see lib/toolclip-config.ts
+	/**
+	 * Whether to inject a single steering reminder per round when the agent
+	 * has left marked tool results un-replaced for several turns. Defaults
+	 * to `true`. Gated by `TOOLCLIP_STEERING_REMINDER`.
+	 */
+	steeringReminder: boolean;
+	/**
+	 * Minimum number of tool-result-bearing turns, while a pending-unreplaced
+	 * marker exists, before the steering reminder becomes eligible. The
+	 * reminder fires at most once per round. Defaults to `3`. Gated by
+	 * `TOOLCLIP_STEERING_REMINDER_TURN`.
+	 */
+	steeringReminderTurn: number;
 }
 
 /**

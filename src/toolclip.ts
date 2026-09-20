@@ -34,10 +34,18 @@ import { createRuntimeState } from "../lib/runtime-state.ts";
 import { estimateTokens } from "../lib/tokens.ts";
 import { buildPendingMarker, buildReplacedMarker } from "../lib/marker.ts";
 import {
+	createSteeringState,
+	resetSteering,
+	unreplacedPendingCount,
+	observeTurn,
+	shouldFireSteering,
+	markFired,
+	buildSteeringMessage,
+} from "../lib/steering.ts";
+import {
 	recordPending,
 	recordReplacement,
 	getReplacement,
-	clear,
 } from "../lib/runtime-state.ts";
 import type { ToolclipRuntimeState } from "../lib/types.ts";
 
@@ -82,8 +90,9 @@ function flattenContent(content: ToolResultEvent["content"]): string {
 }
 
 export default function toolclip(api: ExtensionAPI): void {
-	loadToolclipConfig(); // config plumbing kept; currently no size thresholds
+	const config = loadToolclipConfig();
 	const state: ToolclipRuntimeState = createRuntimeState();
+	const steering = createSteeringState();
 
 	// -----------------------------------------------------------------------
 	// 1. tool_result event handler
@@ -188,6 +197,10 @@ export default function toolclip(api: ExtensionAPI): void {
 	//    into the system prompt
 	// -----------------------------------------------------------------------
 	api.on("before_agent_start", (event: BeforeAgentStartEvent) => {
+		// New round: reset the steering latch so the reminder can fire at most
+		// once for this round.
+		resetSteering(steering);
+
 		const toolclipInstructions =
 			"\n## Tool Result Replacement\n" +
 			"When a long tool result has a [tool-result-pending-replacement: ...] marker, " +
@@ -215,11 +228,16 @@ export default function toolclip(api: ExtensionAPI): void {
 		return {
 			systemPrompt: event.systemPrompt + toolclipInstructions,
 		} satisfies BeforeAgentStartEventResult;
-
 	});
 
 	// -----------------------------------------------------------------------
-	// 4. context event handler — swap replaced results before each LLM call
+	// 4. context event handler — swap replaced results before each LLM call,
+	//    and (once per round) append a trailing steering reminder when the
+	//    agent has left marked results un-replaced for several turns.
+	//
+	//    The reminder is appended as a NEW trailing user message — pi's
+	//    standard steering path. It touches only the tail; the cached prefix
+	//    (original prompt + all prior messages) is never modified.
 	// -----------------------------------------------------------------------
 	api.on("context", (event: ContextEvent) => {
 		const modified = event.messages.map((msg) => {
@@ -239,6 +257,22 @@ export default function toolclip(api: ExtensionAPI): void {
 				],
 			};
 		});
+
+		// Steering reminder: at most once per round. Observe this turn first
+		// (advances the pending-turn counter when there is something to remind
+		// about), then decide. The reminder lands LAST in the returned messages
+		// so it is the freshest context the model sees — and the prefix up to it
+		// stays cached.
+		const unreplaced = unreplacedPendingCount(state);
+		observeTurn(steering, unreplaced);
+		if (shouldFireSteering(steering, unreplaced, config.steeringReminderTurn, config.steeringReminder)) {
+			markFired(steering);
+			modified.push({
+				role: "user" as const,
+				content: [{ type: "text" as const, text: buildSteeringMessage(unreplaced) }],
+				timestamp: Date.now(),
+			});
+		}
 
 		return { messages: modified };
 	});

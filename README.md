@@ -23,10 +23,18 @@ The LLM is the only actor. There is no auto-summarizer and no auto-eviction. The
    ```
    The marker stays for traceability. Cache breaks here — by design.
 4. If the LLM never calls the tool, the original result stays in place. No automatic eviction.
+5. **Steering reminder.** If the agent leaves marked results un-replaced for several turns, toolclip injects a single trailing `user` message reminding it to call `replace_tool_result`. This fires **at most once per round**. It is cache-safe: it is appended to the *end* of the context as a new user block (pi's standard steering path), so the cached prefix — original prompt and all prior messages — is never touched; only the tail re-prepills.
 
 ## Configuration
 
 No size-bound configuration is applied at present. Size thresholds (the marker token threshold and the max-replacement-ratio) were removed so replacement behavior can be observed without pre-filtering or gating — the bet being that we should confirm replacements actually bloat context before band-aiding a healthy finger. The config plumbing (`loadToolclipConfig`) and the `ToolclipConfig` interface remain in place so limits can be reintroduced once observation warrants.
+
+The steering reminder is configurable:
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `TOOLCLIP_STEERING_REMINDER` | `true` | Whether to inject the once-per-round steering reminder when marked results stay un-replaced. |
+| `TOOLCLIP_STEERING_REMINDER_TURN` | `3` | Minimum number of tool-result-bearing turns (with an un-replaced marker present) before the reminder becomes eligible. The reminder fires at most once per round. |
 
 Token estimation uses `Math.ceil(text.length / 4)` (chars/4 heuristic).
 

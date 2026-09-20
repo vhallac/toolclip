@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import toolclip from "../src/toolclip.ts";
 import { createMockApi, invokeHandler, invokeTool } from "./_helpers/mock-pi.ts";
+import type { Handler } from "./_helpers/mock-pi.ts";
 
 // -----------------------------------------------------------------------
 // tool_result event handler tests
@@ -398,6 +399,178 @@ describe("context event handler", () => {
 		};
 
 		expect(result.messages).toEqual(event.messages);
+	});
+});
+
+// -----------------------------------------------------------------------
+// steering reminder tests (context handler)
+// -----------------------------------------------------------------------
+describe("steering reminder injection", () => {
+	const LONG = "x".repeat(2000); // 500 tokens
+
+	// Helper: emit a tool_result to create a pending (un-replaced) entry.
+	function emitPending(handlers: Map<string, Handler[]>, toolCallId: string): void {
+		invokeHandler(handlers, "tool_result", {
+			type: "tool_result",
+			toolCallId,
+			toolName: "bash",
+			content: [{ type: "text", text: LONG }],
+			isError: false,
+		});
+	}
+
+	function fireContext(
+		handlers: Map<string, Handler[]>,
+		toolCallId: string,
+	): { messages: Array<Record<string, unknown>> } {
+		return invokeHandler(handlers, "context", {
+			type: "context",
+			messages: [
+				{
+					role: "toolResult",
+					toolCallId,
+					toolName: "bash",
+					content: [{ type: "text", text: LONG }],
+					isError: false,
+				},
+			],
+		}) as { messages: Array<Record<string, unknown>> };
+	}
+
+	it("does not inject a reminder when there are no pending markers", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+
+		// Fire several context events with no pending entries at all.
+		for (let i = 0; i < 5; i++) {
+			const result = invokeHandler(handlers, "context", {
+				type: "context",
+				messages: [{ role: "user", content: [{ type: "text", text: "hi" }] }],
+			}) as { messages: Array<Record<string, unknown>> };
+			expect(result.messages).toHaveLength(1);
+			expect(result.messages[0].role).toBe("user");
+		}
+	});
+
+	it("does not inject before the turn threshold is reached", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+		emitPending(handlers, "t-1");
+
+		// Turns 1 and 2: threshold is 3, so no reminder yet.
+		const r1 = fireContext(handlers, "t-1");
+		expect(r1.messages).toHaveLength(1);
+		const r2 = fireContext(handlers, "t-1");
+		expect(r2.messages).toHaveLength(1);
+	});
+
+	it("injects a single trailing user reminder once the threshold is reached", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+		emitPending(handlers, "t-1");
+
+		fireContext(handlers, "t-1"); // turn 1
+		fireContext(handlers, "t-1"); // turn 2
+		const r3 = fireContext(handlers, "t-1"); // turn 3 -> fires
+
+		expect(r3.messages).toHaveLength(2);
+		const reminder = r3.messages[1];
+		expect(reminder.role).toBe("user");
+		const text = (reminder.content as Array<{ type: string; text: string }>)[0].text;
+		expect(text).toContain("tool-result-pending-replacement");
+		expect(text).toContain("replace_tool_result");
+		expect(typeof reminder.timestamp).toBe("number");
+	});
+
+	it("never injects twice in the same round", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+		emitPending(handlers, "t-1");
+
+		fireContext(handlers, "t-1"); // 1
+		fireContext(handlers, "t-1"); // 2
+		const r3 = fireContext(handlers, "t-1"); // 3 -> fires
+		expect(r3.messages).toHaveLength(2);
+
+		// Subsequent turns must NOT add another reminder.
+		const r4 = fireContext(handlers, "t-1");
+		expect(r4.messages).toHaveLength(1);
+		const r5 = fireContext(handlers, "t-1");
+		expect(r5.messages).toHaveLength(1);
+	});
+
+	it("does not inject when all pending results have been replaced", async () => {
+		const { handlers, pi, tools } = createMockApi();
+		toolclip(pi as never);
+		emitPending(handlers, "t-1");
+
+		// Replace before the threshold — no reminder should ever fire.
+		await invokeTool(tools, "replace_tool_result", "llm-1", {
+			toolCallId: "t-1",
+			replacement: "done",
+		});
+
+		for (let i = 0; i < 5; i++) {
+			const r = fireContext(handlers, "t-1");
+			// Only the (swapped) tool result; no appended reminder.
+			expect(r.messages).toHaveLength(1);
+		}
+	});
+
+	it("resets across rounds (before_agent_start re-arms the latch)", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+		emitPending(handlers, "t-1");
+
+		// Fire the reminder in round 1.
+		fireContext(handlers, "t-1"); // 1
+		fireContext(handlers, "t-1"); // 2
+		const r3 = fireContext(handlers, "t-1"); // 3 -> fires
+		expect(r3.messages).toHaveLength(2);
+
+		// New round: before_agent_start resets the latch.
+		invokeHandler(handlers, "before_agent_start", {
+			type: "before_agent_start",
+			prompt: "next round",
+			images: undefined,
+			systemPrompt: "base",
+			systemPromptOptions: { cwd: "/x" },
+		});
+
+		// Round 2: reminder can fire again after the threshold.
+		fireContext(handlers, "t-1"); // 1
+		fireContext(handlers, "t-1"); // 2
+		const r3b = fireContext(handlers, "t-1"); // 3 -> fires again
+		expect(r3b.messages).toHaveLength(2);
+		expect(r3b.messages[1].role).toBe("user");
+	});
+
+	it("appends the reminder as the LAST message", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+		emitPending(handlers, "t-1");
+
+		fireContext(handlers, "t-1"); // 1
+		fireContext(handlers, "t-1"); // 2
+
+		// A context event whose last message is an assistant message — the
+		// reminder must land after it, as the new tail.
+		const result = invokeHandler(handlers, "context", {
+			type: "context",
+			messages: [
+				{
+					role: "toolResult",
+					toolCallId: "t-1",
+					toolName: "bash",
+					content: [{ type: "text", text: LONG }],
+					isError: false,
+				},
+				{ role: "assistant", content: [{ type: "text", text: "thinking" }] },
+			],
+		}) as { messages: Array<Record<string, unknown>> };
+
+		expect(result.messages).toHaveLength(3);
+		expect(result.messages[2].role).toBe("user");
 	});
 });
 
