@@ -2,43 +2,38 @@ import { describe, expect, it } from "vitest";
 import {
 	buildSteeringMessage,
 	createSteeringState,
-	markFired,
-	observeTurn,
+	observePendingBand,
 	resetSteering,
-	shouldFireSteering,
-	unreplacedPendingCount,
+	unreplacedPendingIds,
 } from "../lib/steering.ts";
 import { createRuntimeState, recordPending, recordReplacement } from "../lib/runtime-state.js";
 
 const LONG = "x".repeat(2000); // 500 tokens
 
 describe("createSteeringState", () => {
-	it("starts unfired with zero pending turns", () => {
+	it("starts with band 0 (nothing announced)", () => {
 		const s = createSteeringState();
-		expect(s.fired).toBe(false);
-		expect(s.turnsWithPending).toBe(0);
+		expect(s.announcedBand).toBe(0);
 	});
 });
 
 describe("resetSteering", () => {
-	it("clears fired and turn count in place", () => {
+	it("resets the band to 0 in place", () => {
 		const s = createSteeringState();
-		s.fired = true;
-		s.turnsWithPending = 9;
+		s.announcedBand = 3;
 		resetSteering(s);
-		expect(s.fired).toBe(false);
-		expect(s.turnsWithPending).toBe(0);
+		expect(s.announcedBand).toBe(0);
 		// mutates the same object (no re-allocation)
 		expect(s).toBe(s);
 	});
 });
 
-describe("unreplacedPendingCount", () => {
-	it("counts pending entries that have no replacement", () => {
+describe("unreplacedPendingIds", () => {
+	it("collects pending entries that have no replacement", () => {
 		const rt = createRuntimeState();
 		recordPending(rt, "a", 100, LONG);
 		recordPending(rt, "b", 100, LONG);
-		expect(unreplacedPendingCount(rt)).toBe(2);
+		expect(unreplacedPendingIds(rt).sort()).toEqual(["a", "b"]);
 	});
 
 	it("excludes replaced entries", () => {
@@ -46,111 +41,93 @@ describe("unreplacedPendingCount", () => {
 		recordPending(rt, "a", 100, LONG);
 		recordPending(rt, "b", 100, LONG);
 		recordReplacement(rt, "a", "short", 1);
-		expect(unreplacedPendingCount(rt)).toBe(1);
+		expect(unreplacedPendingIds(rt)).toEqual(["b"]);
 	});
 
-	it("is zero when empty", () => {
-		expect(unreplacedPendingCount(createRuntimeState())).toBe(0);
-	});
-});
-
-describe("observeTurn", () => {
-	it("advances the counter only when there is an unreplaced pending result", () => {
-		const s = createSteeringState();
-		expect(observeTurn(s, 0)).toBe(0); // nothing to remind about
-		expect(observeTurn(s, 2)).toBe(1); // pending present -> advance
-		expect(observeTurn(s, 2)).toBe(2);
-		expect(observeTurn(s, 0)).toBe(2); // resolved -> no advance
-	});
-
-	it("does not advance on turns with nothing pending", () => {
-		const s = createSteeringState();
-		observeTurn(s, 0);
-		observeTurn(s, 0);
-		expect(s.turnsWithPending).toBe(0);
+	it("is empty when empty", () => {
+		expect(unreplacedPendingIds(createRuntimeState())).toEqual([]);
 	});
 });
 
-describe("shouldFireSteering", () => {
+describe("observePendingBand", () => {
 	it("does not fire when disabled via config", () => {
 		const s = createSteeringState();
-		observeTurn(s, 5);
-		expect(shouldFireSteering(s, 3, 3, false)).toBe(false);
+		expect(observePendingBand(s, 7, 5, false)).toBe(false);
+		expect(s.announcedBand).toBe(0); // band not tracked while disabled
 	});
 
-	it("does not fire when already fired this round", () => {
+	it("does not fire below the first multiple", () => {
 		const s = createSteeringState();
-		observeTurn(s, 5);
-		markFired(s);
-		expect(shouldFireSteering(s, 3, 3, true)).toBe(false);
+		expect(observePendingBand(s, 1, 5, true)).toBe(false);
+		expect(observePendingBand(s, 4, 5, true)).toBe(false);
 	});
 
-	it("does not fire when there is nothing unreplaced", () => {
+	it("fires when the count first reaches the band size", () => {
 		const s = createSteeringState();
-		observeTurn(s, 0);
-		expect(shouldFireSteering(s, 0, 3, true)).toBe(false);
+		expect(observePendingBand(s, 5, 5, true)).toBe(true);
+		expect(s.announcedBand).toBe(1);
 	});
 
-	it("does not fire before the turn threshold is reached", () => {
+	it("fires once per band, then again at the next multiple", () => {
 		const s = createSteeringState();
-		observeTurn(s, 2); // turnsWithPending = 1
-		expect(shouldFireSteering(s, 2, 3, true)).toBe(false);
-		observeTurn(s, 2); // = 2
-		expect(shouldFireSteering(s, 2, 3, true)).toBe(false);
+		expect(observePendingBand(s, 7, 5, true)).toBe(true); // 5-9 band entered
+		expect(observePendingBand(s, 8, 5, true)).toBe(false);
+		expect(observePendingBand(s, 9, 5, true)).toBe(false);
+		expect(observePendingBand(s, 12, 5, true)).toBe(true); // 10-14 band entered
+		expect(observePendingBand(s, 14, 5, true)).toBe(false);
 	});
 
-	it("fires when threshold reached and conditions hold", () => {
+	it("fires once for a jump across several bands (announces the current band)", () => {
 		const s = createSteeringState();
-		observeTurn(s, 2); // 1
-		observeTurn(s, 2); // 2
-		observeTurn(s, 2); // 3 -> reaches threshold
-		expect(shouldFireSteering(s, 2, 3, true)).toBe(true);
+		expect(observePendingBand(s, 13, 5, true)).toBe(true); // 0 -> band 2, one fire
+		expect(s.announcedBand).toBe(2);
+		expect(observePendingBand(s, 13, 5, true)).toBe(false);
 	});
 
-	it("treats threshold inclusively (fires exactly when count == threshold)", () => {
+	it("re-arms when the count drops below the announced band", () => {
 		const s = createSteeringState();
-		observeTurn(s, 1);
-		observeTurn(s, 1);
-		expect(shouldFireSteering(s, 1, 2, true)).toBe(true);
+		observePendingBand(s, 6, 5, true); // band 1 announced
+		expect(observePendingBand(s, 3, 5, true)).toBe(false); // drop: band follows to 0
+		expect(s.announcedBand).toBe(0);
+		expect(observePendingBand(s, 5, 5, true)).toBe(true); // re-grown pile nagged again
+		expect(observePendingBand(s, 6, 5, true)).toBe(false);
 	});
 
-	it("respects a custom threshold", () => {
+	it("does not re-fire while the count stays inside the announced band after a partial drop", () => {
 		const s = createSteeringState();
-		observeTurn(s, 1);
-		expect(shouldFireSteering(s, 1, 5, true)).toBe(false);
-		observeTurn(s, 1);
-		observeTurn(s, 1);
-		observeTurn(s, 1);
-		observeTurn(s, 1); // 5
-		expect(shouldFireSteering(s, 1, 5, true)).toBe(true);
+		observePendingBand(s, 12, 5, true); // band 2 announced
+		observePendingBand(s, 7, 5, true); // drop into band 1: follows down silently
+		expect(s.announcedBand).toBe(1);
+		expect(observePendingBand(s, 9, 5, true)).toBe(false); // same band
+		expect(observePendingBand(s, 10, 5, true)).toBe(true); // next band
 	});
-});
 
-describe("markFired", () => {
-	it("sets fired and is idempotent", () => {
+	it("respects a custom multiple", () => {
 		const s = createSteeringState();
-		expect(s.fired).toBe(false);
-		markFired(s);
-		expect(s.fired).toBe(true);
-		markFired(s);
-		expect(s.fired).toBe(true);
+		expect(observePendingBand(s, 2, 3, true)).toBe(false);
+		expect(observePendingBand(s, 3, 3, true)).toBe(true);
+		expect(observePendingBand(s, 5, 3, true)).toBe(false);
+		expect(observePendingBand(s, 6, 3, true)).toBe(true);
 	});
 });
 
 describe("buildSteeringMessage", () => {
-	it("mentions the count and the replace_tool_result tool", () => {
-		const msg = buildSteeringMessage(3);
-		expect(msg).toContain("3 tool results are");
-		expect(msg).toContain("tool-result-pending-replacement");
+	it("mentions the count, the anti-hoarding rule, and the replace tool", () => {
+		const msg = buildSteeringMessage(3, ["a", "b", "c"]);
+		expect(msg).toContain("3 tool-result-pending-replacements");
 		expect(msg).toContain("replace_tool_result");
+		expect(msg).toContain("just in case");
 	});
 
-	it("uses singular wording for one result", () => {
-		const msg = buildSteeringMessage(1);
-		expect(msg).toContain("1 tool result is");
+	it("lists each pending id on its own line", () => {
+		const msg = buildSteeringMessage(2, ["id-1", "id-2"]);
+		expect(msg).toContain("- id-1");
+		expect(msg).toContain("- id-2");
+		expect(msg.indexOf("- id-1")).toBeLessThan(msg.indexOf("- id-2"));
 	});
 
-	it("is non-empty for zero (defensive)", () => {
-		expect(buildSteeringMessage(0).length).toBeGreaterThan(0);
+	it("ends with the id list", () => {
+		const msg = buildSteeringMessage(1, ["solo"]);
+		expect(msg.trimEnd().endsWith("- solo")).toBe(true);
 	});
 });

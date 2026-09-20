@@ -6,7 +6,7 @@ describe("loadToolclipConfig", () => {
 		expect(loadToolclipConfig({} as NodeJS.ProcessEnv)).toEqual({
 			toolResultThresholdTokens: 1000,
 			steeringReminder: true,
-			steeringReminderTurn: 3,
+			steeringReminderMultiple: 5,
 			quarantine: true,
 			quarantineThresholdTokens: 10000,
 		});
@@ -18,7 +18,7 @@ describe("loadToolclipConfig", () => {
 		} as NodeJS.ProcessEnv);
 
 		expect(config.steeringReminder).toBe(false);
-		expect(config.steeringReminderTurn).toBe(3);
+		expect(config.steeringReminderMultiple).toBe(5);
 	});
 
 	it("enables the steering reminder via TOOLCLIP_STEERING_REMINDER=1", () => {
@@ -29,20 +29,20 @@ describe("loadToolclipConfig", () => {
 		expect(config.steeringReminder).toBe(true);
 	});
 
-	it("overrides the turn threshold via TOOLCLIP_STEERING_REMINDER_TURN", () => {
+	it("overrides the band size via TOOLCLIP_STEERING_REMINDER_MULTIPLE", () => {
 		const config = loadToolclipConfig({
-			TOOLCLIP_STEERING_REMINDER_TURN: "5",
+			TOOLCLIP_STEERING_REMINDER_MULTIPLE: "10",
 		} as NodeJS.ProcessEnv);
 
-		expect(config.steeringReminderTurn).toBe(5);
+		expect(config.steeringReminderMultiple).toBe(10);
 	});
 
-	it("falls back to default turn threshold for non-positive or non-integer values", () => {
+	it("falls back to default band size for non-positive or non-integer values", () => {
 		for (const bad of ["0", "-1", "2.5", "abc", ""]) {
 			const config = loadToolclipConfig({
-				TOOLCLIP_STEERING_REMINDER_TURN: bad,
+				TOOLCLIP_STEERING_REMINDER_MULTIPLE: bad,
 			} as NodeJS.ProcessEnv);
-			expect(config.steeringReminderTurn).toBe(3);
+			expect(config.steeringReminderMultiple).toBe(5);
 		}
 	});
 
@@ -73,7 +73,7 @@ describe("loadToolclipConfig", () => {
 		expect(config).toEqual({
 			toolResultThresholdTokens: 1000,
 			steeringReminder: true,
-			steeringReminderTurn: 3,
+			steeringReminderMultiple: 5,
 			quarantine: true,
 			quarantineThresholdTokens: 10000,
 		});

@@ -687,12 +687,11 @@ describe("context event handler", () => {
 		expect(result.messages).toEqual(event.messages);
 	});
 });
-
 // -----------------------------------------------------------------------
 // steering reminder tests (context handler)
 // -----------------------------------------------------------------------
 describe("steering reminder injection", () => {
-	const LONG = "x".repeat(9000); // 1286 tokens — above the 1000 threshold
+	const LONG = "x".repeat(9000); // above the 1000-token threshold
 
 	// Helper: emit a tool_result to create a pending (un-replaced) entry.
 	function emitPending(handlers: Map<string, Handler[]>, toolCallId: string): void {
@@ -705,22 +704,25 @@ describe("steering reminder injection", () => {
 		});
 	}
 
-	function fireContext(
+	function runContext(
 		handlers: Map<string, Handler[]>,
-		toolCallId: string,
+		ids: string[],
 	): { messages: Array<Record<string, unknown>> } {
 		return invokeHandler(handlers, "context", {
 			type: "context",
-			messages: [
-				{
-					role: "toolResult",
-					toolCallId,
-					toolName: "bash",
-					content: [{ type: "text", text: LONG }],
-					isError: false,
-				},
-			],
+			messages: ids.map((toolCallId) => ({
+				role: "toolResult",
+				toolCallId,
+				toolName: "bash",
+				content: [{ type: "text", text: LONG }],
+				isError: false,
+			})),
 		}) as { messages: Array<Record<string, unknown>> };
+	}
+
+	function reminderText(result: { messages: Array<Record<string, unknown>> }): string {
+		const reminder = result.messages[result.messages.length - 1];
+		return ((reminder.content as Array<{ type: string; text: string }>)[0]).text;
 	}
 
 	it("does not inject a reminder when there are no pending markers", () => {
@@ -738,83 +740,128 @@ describe("steering reminder injection", () => {
 		}
 	});
 
-	it("does not inject before the turn threshold is reached", () => {
+	it("does not inject while the count is below the band size", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
-		emitPending(handlers, "t-1");
+		for (const id of ["t-1", "t-2", "t-3", "t-4"]) {
+			emitPending(handlers, id);
+		}
 
-		// Turns 1 and 2: threshold is 3, so no reminder yet.
-		const r1 = fireContext(handlers, "t-1");
-		expect(r1.messages).toHaveLength(1);
-		const r2 = fireContext(handlers, "t-1");
-		expect(r2.messages).toHaveLength(1);
+		// Band size is 5: four pendings never cross it, however often the
+		// context event fires.
+		for (let i = 0; i < 3; i++) {
+			const r = runContext(handlers, ["t-1", "t-2", "t-3", "t-4"]);
+			expect(r.messages).toHaveLength(4);
+		}
 	});
 
-	it("injects a single trailing user reminder once the threshold is reached", () => {
+	it("injects a trailing user reminder when the count reaches the band size", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
-		emitPending(handlers, "t-1");
+		for (const id of ["t-1", "t-2", "t-3", "t-4", "t-5"]) {
+			emitPending(handlers, id);
+		}
 
-		fireContext(handlers, "t-1"); // turn 1
-		fireContext(handlers, "t-1"); // turn 2
-		const r3 = fireContext(handlers, "t-1"); // turn 3 -> fires
-
-		expect(r3.messages).toHaveLength(2);
-		const reminder = r3.messages[1];
-		expect(reminder.role).toBe("user");
-		const text = (reminder.content as Array<{ type: string; text: string }>)[0].text;
-		expect(text).toContain("tool-result-pending-replacement");
+		const r = runContext(handlers, ["t-1", "t-2", "t-3", "t-4", "t-5"]);
+		expect(r.messages).toHaveLength(6);
+		expect(r.messages[5].role).toBe("user");
+		const text = reminderText(r);
+		expect(text).toContain("5 tool-result-pending-replacements");
 		expect(text).toContain("replace_tool_result");
-		expect(typeof reminder.timestamp).toBe("number");
+		expect(text).toContain("just in case");
+		for (const id of ["t-1", "t-2", "t-3", "t-4", "t-5"]) {
+			expect(text).toContain(`- ${id}`);
+		}
+		expect(typeof r.messages[5].timestamp).toBe("number");
 	});
 
-	it("never injects twice in the same round", () => {
+	it("does not fire twice within the same band, fires again at the next multiple", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
-		emitPending(handlers, "t-1");
+		const ids = ["t-1", "t-2", "t-3", "t-4", "t-5"];
+		for (const id of ids) emitPending(handlers, id);
 
-		fireContext(handlers, "t-1"); // 1
-		fireContext(handlers, "t-1"); // 2
-		const r3 = fireContext(handlers, "t-1"); // 3 -> fires
-		expect(r3.messages).toHaveLength(2);
+		const r5 = runContext(handlers, ids);
+		expect(r5.messages).toHaveLength(6); // fires at 5
 
-		// Subsequent turns must NOT add another reminder.
-		const r4 = fireContext(handlers, "t-1");
-		expect(r4.messages).toHaveLength(1);
-		const r5 = fireContext(handlers, "t-1");
-		expect(r5.messages).toHaveLength(1);
+		// Grow the pile within the same band (6..9): no further reminders.
+		for (const id of ["t-6", "t-7", "t-8", "t-9"]) {
+			emitPending(handlers, id);
+			ids.push(id);
+			const r = runContext(handlers, ids);
+			expect(r.messages).toHaveLength(ids.length);
+		}
+
+		// Crossing into the 10-14 band fires again.
+		emitPending(handlers, "t-10");
+		ids.push("t-10");
+		const r10 = runContext(handlers, ids);
+		expect(r10.messages).toHaveLength(ids.length + 1);
+		expect(reminderText(r10)).toContain("10 tool-result-pending-replacements");
+	});
+
+	it("re-arms after the pile is replaced back down below the band", async () => {
+		const { handlers, pi, tools } = createMockApi();
+		toolclip(pi as never);
+		const ids = ["t-1", "t-2", "t-3", "t-4", "t-5"];
+		for (const id of ids) emitPending(handlers, id);
+		const r5 = runContext(handlers, ids);
+		expect(r5.messages).toHaveLength(6); // fires at 5
+
+		// Replace three of them: count drops to 2, band follows down.
+		for (const id of ["t-1", "t-2", "t-3"]) {
+			await invokeTool(tools, "replace_tool_result", "llm-1", {
+				toolCallId: id,
+				replacement: "distilled",
+			});
+		}
+		const remaining = ids.filter((id) => !["t-1", "t-2", "t-3"].includes(id));
+		const r2 = runContext(handlers, remaining);
+		expect(r2.messages).toHaveLength(2); // no reminder at count 2
+
+		// Re-grow the pile to 5: the reminder fires again for the new set.
+		for (const id of ["t-6", "t-7", "t-8"]) {
+			emitPending(handlers, id);
+			remaining.push(id);
+		}
+		const rAgain = runContext(handlers, remaining);
+		expect(rAgain.messages).toHaveLength(remaining.length + 1);
+		const text = reminderText(rAgain);
+		expect(text).toContain("5 tool-result-pending-replacements");
+		expect(text).toContain("- t-8");
+		expect(text).not.toContain("- t-1\n");
 	});
 
 	it("does not inject when all pending results have been replaced", async () => {
 		const { handlers, pi, tools } = createMockApi();
 		toolclip(pi as never);
-		emitPending(handlers, "t-1");
-
-		// Replace before the threshold — no reminder should ever fire.
-		await invokeTool(tools, "replace_tool_result", "llm-1", {
-			toolCallId: "t-1",
-			replacement: "done",
-		});
+		const ids = ["t-1", "t-2", "t-3", "t-4", "t-5"];
+		for (const id of ids) emitPending(handlers, id);
+		for (const id of ids) {
+			await invokeTool(tools, "replace_tool_result", "llm-1", {
+				toolCallId: id,
+				replacement: "done",
+			});
+		}
 
 		for (let i = 0; i < 5; i++) {
-			const r = fireContext(handlers, "t-1");
-			// Only the (swapped) tool result; no appended reminder.
-			expect(r.messages).toHaveLength(1);
+			const r = runContext(handlers, ids);
+			// Only the (swapped) tool results; no appended reminder.
+			expect(r.messages).toHaveLength(ids.length);
 		}
 	});
 
-	it("resets across rounds (before_agent_start re-arms the latch)", () => {
+	it("re-announces a persistent pile on the first LLM call of the next round", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
-		emitPending(handlers, "t-1");
+		const ids = ["t-1", "t-2", "t-3", "t-4", "t-5"];
+		for (const id of ids) emitPending(handlers, id);
 
 		// Fire the reminder in round 1.
-		fireContext(handlers, "t-1"); // 1
-		fireContext(handlers, "t-1"); // 2
-		const r3 = fireContext(handlers, "t-1"); // 3 -> fires
-		expect(r3.messages).toHaveLength(2);
+		const r1 = runContext(handlers, ids);
+		expect(r1.messages).toHaveLength(6);
 
-		// New round: before_agent_start resets the latch.
+		// New round: before_agent_start resets the band.
 		invokeHandler(handlers, "before_agent_start", {
 			type: "before_agent_start",
 			prompt: "next round",
@@ -823,40 +870,36 @@ describe("steering reminder injection", () => {
 			systemPromptOptions: { cwd: "/x" },
 		});
 
-		// Round 2: reminder can fire again after the threshold.
-		fireContext(handlers, "t-1"); // 1
-		fireContext(handlers, "t-1"); // 2
-		const r3b = fireContext(handlers, "t-1"); // 3 -> fires again
-		expect(r3b.messages).toHaveLength(2);
-		expect(r3b.messages[1].role).toBe("user");
+		// The un-replaced pile is re-announced on the round's first LLM call.
+		const r2 = runContext(handlers, ids);
+		expect(r2.messages).toHaveLength(6);
+		expect(r2.messages[5].role).toBe("user");
 	});
 
 	it("appends the reminder as the LAST message", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
-		emitPending(handlers, "t-1");
-
-		fireContext(handlers, "t-1"); // 1
-		fireContext(handlers, "t-1"); // 2
+		const ids = ["t-1", "t-2", "t-3", "t-4", "t-5"];
+		for (const id of ids) emitPending(handlers, id);
 
 		// A context event whose last message is an assistant message — the
 		// reminder must land after it, as the new tail.
 		const result = invokeHandler(handlers, "context", {
 			type: "context",
 			messages: [
-				{
+				...ids.map((toolCallId) => ({
 					role: "toolResult",
-					toolCallId: "t-1",
+					toolCallId,
 					toolName: "bash",
 					content: [{ type: "text", text: LONG }],
 					isError: false,
-				},
+				})),
 				{ role: "assistant", content: [{ type: "text", text: "thinking" }] },
 			],
 		}) as { messages: Array<Record<string, unknown>> };
 
-		expect(result.messages).toHaveLength(3);
-		expect(result.messages[2].role).toBe("user");
+		expect(result.messages).toHaveLength(7);
+		expect(result.messages[6].role).toBe("user");
 	});
 });
 

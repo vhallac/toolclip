@@ -23,18 +23,19 @@ export interface ToolclipConfig {
 	 */
 	toolResultThresholdTokens: number;
 	/**
-	 * Whether to inject a single steering reminder per round when the agent
-	 * has left marked tool results un-replaced for several turns. Defaults
-	 * to `true`. Gated by `TOOLCLIP_STEERING_REMINDER`.
+	 * Whether to inject count-band steering reminders when the agent has
+	 * left marked tool results un-replaced. Defaults to `true`. Gated by
+	 * `TOOLCLIP_STEERING_REMINDER`.
 	 */
 	steeringReminder: boolean;
 	/**
-	 * Minimum number of tool-result-bearing turns, while a pending-unreplaced
-	 * marker exists, before the steering reminder becomes eligible. The
-	 * reminder fires at most once per round. Defaults to `3`. Gated by
-	 * `TOOLCLIP_STEERING_REMINDER_TURN`.
+	 * Band size for the count-based steering reminder: it fires when the
+	 * number of un-replaced pending results first reaches each multiple of
+	 * this value (5–9, 10–14, ... for the default `5`), and re-arms when the
+	 * count drops back below the announced band. Defaults to `5`. Gated by
+	 * `TOOLCLIP_STEERING_REMINDER_MULTIPLE`.
 	 */
-	steeringReminderTurn: number;
+	steeringReminderMultiple: number;
 	/**
 	 * Whether oversized tool results are quarantined (content swapped for a
 	 * notice, payload held for one turn). Defaults to `true`. Gated by

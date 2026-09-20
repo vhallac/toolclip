@@ -74,10 +74,8 @@ import {
 import {
 	createSteeringState,
 	resetSteering,
-	unreplacedPendingCount,
-	observeTurn,
-	shouldFireSteering,
-	markFired,
+	unreplacedPendingIds,
+	observePendingBand,
 	buildSteeringMessage,
 } from "../lib/steering.ts";
 import {
@@ -478,8 +476,9 @@ export default function toolclip(api: ExtensionAPI): void {
 	//    into the system prompt
 	// -----------------------------------------------------------------------
 	api.on("before_agent_start", (event: BeforeAgentStartEvent) => {
-		// New round: reset the steering latch so the reminder can fire at most
-		// once for this round, and restart the per-round re-read counter.
+		// New round: reset the steering band so a pending pile persisting into
+		// this round is re-announced on its first LLM call, and restart the
+		// per-round re-read counter.
 		resetSteering(steering);
 		resetRereads(state.readsThisRound);
 
@@ -546,8 +545,8 @@ export default function toolclip(api: ExtensionAPI): void {
 
 	// -----------------------------------------------------------------------
 	// 4. context event handler — swap replaced results before each LLM call,
-	//    and (once per round) append a trailing steering reminder when the
-	//    agent has left marked results un-replaced for several turns.
+	//    and append a trailing steering reminder when the pending count has
+	//    entered a new multiple of `steeringReminderMultiple` (default 5).
 	//
 	//    The reminder is appended as a NEW trailing user message — pi's
 	//    standard steering path. It touches only the tail; the cached prefix
@@ -572,18 +571,17 @@ export default function toolclip(api: ExtensionAPI): void {
 			};
 		});
 
-		// Steering reminder: at most once per round. Observe this turn first
-		// (advances the pending-turn counter when there is something to remind
-		// about), then decide. The reminder lands LAST in the returned messages
-		// so it is the freshest context the model sees — and the prefix up to it
+		// Steering reminder: count-based. Observe the pending count first —
+		// it fires when the count first reaches each multiple of the band size
+		// (5–9, 10–14, ...), and re-arms when the count drops back below the
+		// announced band. The reminder lands LAST in the returned messages so
+		// it is the freshest context the model sees — and the prefix up to it
 		// stays cached.
-		const unreplaced = unreplacedPendingCount(state);
-		observeTurn(steering, unreplaced);
-		if (shouldFireSteering(steering, unreplaced, config.steeringReminderTurn, config.steeringReminder)) {
-			markFired(steering);
+		const pendingIds = unreplacedPendingIds(state);
+		if (observePendingBand(steering, pendingIds.length, config.steeringReminderMultiple, config.steeringReminder)) {
 			modified.push({
 				role: "user" as const,
-				content: [{ type: "text" as const, text: buildSteeringMessage(unreplaced) }],
+				content: [{ type: "text" as const, text: buildSteeringMessage(pendingIds.length, pendingIds) }],
 				timestamp: Date.now(),
 			});
 		}

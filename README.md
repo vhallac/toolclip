@@ -25,7 +25,7 @@ The LLM is the only actor. There is no auto-summarizer and no auto-eviction. The
    ```
    The marker stays for traceability. Cache breaks here — by design.
 4. If the LLM never calls the tool, the original result stays in place. No automatic eviction.
-5. **Steering reminder.** If the agent leaves marked results un-replaced for several turns, toolclip injects a single trailing `user` message reminding it to call `replace_tool_result`. This fires **at most once per round**. It is cache-safe: it is appended to the *end* of the context as a new user block (pi's standard steering path), so the cached prefix — original prompt and all prior messages — is never touched; only the tail re-prepills.
+5. **Steering reminder.** If the agent leaves marked results un-replaced, toolclip watches the pending count (on the `context` event, before each LLM call) and injects a trailing `user` message when the count first reaches each multiple of the band size (default 5: 5–9, 10–14, 15–19, ...). The reminder summarizes the pile — "you have N tool-result-pending-replacements" — and lists the pending ids so the agent can act on them in one batched call. When the count drops below the announced band (the agent replaced results), the band follows down silently, so a re-grown pile is nagged again. The band resets at each round boundary, so a pile persisting into a new round is re-announced on its first LLM call. Cache-safe: appended to the *end* of the context as a new user block (pi's standard steering path), so the cached prefix is never touched; only the tail re-prepills.
 6. **Quarantine.** Results above a much higher threshold (default 10000 tokens) are withheld from the LLM entirely: the content is swapped for a notice
    ```
    [tool-result-quarantined: toolCallId=abc, tokens=12000]
@@ -40,8 +40,8 @@ The LLM is the only actor. There is no auto-summarizer and no auto-eviction. The
 | Env var | Default | Meaning |
 |---|---|---|
 | `TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS` | `1000` | Minimum estimated token count for a tool result to get a pending marker. Results at or below the threshold are left untouched. |
-| `TOOLCLIP_STEERING_REMINDER` | `true` | Inject a single trailing steering reminder per round when marked results stay un-replaced for several turns. |
-| `TOOLCLIP_STEERING_REMINDER_TURN` | `3` | Minimum tool-result-bearing turns while a pending marker exists before the reminder is eligible. |
+| `TOOLCLIP_STEERING_REMINDER` | `true` | Inject a trailing steering reminder when the pending count first reaches each multiple of the band size, listing the pending ids. |
+| `TOOLCLIP_STEERING_REMINDER_MULTIPLE` | `5` | Band size for the count-based reminder: fires on entry into each new band (5–9, 10–14, ...), re-arms when the count drops below the announced band. |
 | `TOOLCLIP_QUARANTINE` | `true` | Withhold results above the quarantine threshold (payload held for one turn, retrievable via `read_quarantined_result`). Disable to fall back to plain pending markers for all sizes. |
 | `TOOLCLIP_QUARANTINE_THRESHOLD_TOKENS` | `10000` | Minimum estimated token count for a tool result to be quarantined. Well above the pending threshold: routine large results (1k–10k) just get pending markers. |
 

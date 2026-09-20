@@ -8,12 +8,12 @@ import type { ToolclipConfig } from "./types.ts";
 const DEFAULT_TOOL_RESULT_THRESHOLD_TOKENS = 1000;
 
 /**
- * Default turn threshold for the steering reminder. The reminder fires at
- * most once per round, and only once the agent has made at least this many
- * tool-result-bearing turns while a pending-unreplaced marker exists — i.e.
- * it has had a real chance to act on the markers and has not.
+ * Default band size for the count-based steering reminder. The reminder
+ * fires when the number of un-replaced pending results first reaches each
+ * multiple of this value (5–9, 10–14, ...), and re-arms when the count
+ * drops back below the announced band — so a re-grown pile is nagged again.
  */
-const DEFAULT_STEERING_REMINDER_TURN = 3;
+const DEFAULT_STEERING_REMINDER_MULTIPLE = 5;
 
 /**
  * Default minimum token count for a tool result to be quarantined. Well
@@ -53,10 +53,11 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
  * a replacement grew larger than its original (the observation target); no
  * rejection happens.
  *
- * The steering reminder is a single trailing user message injected once per
- * round when the agent has left marked results un-replaced for several
- * turns. It is cache-safe — it is appended to the *end* of the context (a
- * new user block), so the cached prefix is never touched.
+ * The steering reminder is a trailing user message injected when the number
+ * of un-replaced pending results first reaches each multiple of
+ * `steeringReminderMultiple` (default 5), listing the pending ids. It is
+ * cache-safe — it is appended to the *end* of the context (a new user
+ * block), so the cached prefix is never touched.
  *
  * Quarantine: results above `quarantineThresholdTokens` (default 10000) are
  * withheld from the LLM entirely — the content is swapped for a notice and
@@ -71,9 +72,9 @@ export function loadToolclipConfig(env: NodeJS.ProcessEnv = process.env): Toolcl
 			DEFAULT_TOOL_RESULT_THRESHOLD_TOKENS,
 		),
 		steeringReminder: parseBool(env.TOOLCLIP_STEERING_REMINDER, true),
-		steeringReminderTurn: parsePositiveInt(
-			env.TOOLCLIP_STEERING_REMINDER_TURN,
-			DEFAULT_STEERING_REMINDER_TURN,
+		steeringReminderMultiple: parsePositiveInt(
+			env.TOOLCLIP_STEERING_REMINDER_MULTIPLE,
+			DEFAULT_STEERING_REMINDER_MULTIPLE,
 		),
 		quarantine: parseBool(env.TOOLCLIP_QUARANTINE, true),
 		quarantineThresholdTokens: parsePositiveInt(

@@ -2,10 +2,20 @@
  * Steering reminder for toolclip.
  *
  * The failure mode this targets: the agent sees `[tool-result-pending-replacement]`
- * markers but never circles back to call `replace_tool_result` — it defers
- * "until I need this" and then never does. The cheapest possible detection
- * nudge is a single trailing user message, injected once per round, reminding
- * the agent to replace its marked results.
+ * markers but never circles back to call `replace_tool_result` — it *collects*
+ * pending replacements, deferring "until I need this" and then never does.
+ *
+ * The steering is count-based, not turn-based: it fires when the number of
+ * un-replaced pending results enters a new multiple of `multiple` (default 5:
+ * 5–9, 10–14, 15–19, ...). A growing pile is therefore nagged repeatedly —
+ * once per band — instead of once per round, which is what the observed
+ * failure needs: the turn-based reminder fired once and the pile kept growing
+ * in silence afterwards.
+ *
+ * Re-arming: when the count drops below the announced band (the agent acted),
+ * the band follows it down silently. A pile that is later re-grown past the
+ * next band crossing gets a fresh reminder. Without this, a pile announced at
+ * 10 that was partially replaced and re-grown to 9 would stay un-nagged.
  *
  * Cache safety: the reminder is appended to the *end* of the context as a new
  * `user` message. Pi's standard steering path does exactly this — a user
@@ -21,24 +31,23 @@ import type { ToolclipRuntimeState } from "./types.ts";
 
 /**
  * Per-round steering state. Reset at each round boundary (in
- * `before_agent_start`) so the reminder can fire at most once per round.
+ * `before_agent_start`) so a pile persisting into a new round is re-announced
+ * on that round's first LLM call.
  *
- * `turnsWithPending` counts tool-result-bearing turns during which at least
- * one marked result was still un-replaced. It only advances when there *is*
- * something to remind about, so an empty/prompt-only context never trips it.
+ * `announcedBand` is the highest pending-count band (in units of `multiple`)
+ * already announced this round. Band `k` covers counts `[k*multiple,
+ * (k+1)*multiple)`. A band is announced when the count first enters it.
  */
 export interface SteeringState {
-	/** Whether the reminder has already fired this round. */
-	fired: boolean;
-	/** Turns elapsed with an un-replaced pending marker present. */
-	turnsWithPending: number;
+	/** Highest pending-count band already announced this round. */
+	announcedBand: number;
 }
 
 /**
  * Create fresh steering state for a new round.
  */
 export function createSteeringState(): SteeringState {
-	return { fired: false, turnsWithPending: 0 };
+	return { announcedBand: 0 };
 }
 
 /**
@@ -47,92 +56,75 @@ export function createSteeringState(): SteeringState {
  * object survives across rounds without re-allocation.
  */
 export function resetSteering(state: SteeringState): void {
-	state.fired = false;
-	state.turnsWithPending = 0;
+	state.announcedBand = 0;
 }
 
 /**
- * Count how many tracked tool results are still pending (recorded but not
- * yet replaced). Reads from the shared runtime state.
+ * Collect the ids of tracked tool results that are still pending (recorded
+ * but not yet replaced). Reads from the shared runtime state. The count of
+ * pending results is `ids.length`.
  */
-export function unreplacedPendingCount(rt: ToolclipRuntimeState): number {
-	let n = 0;
-	for (const entry of rt.entries.values()) {
+export function unreplacedPendingIds(rt: ToolclipRuntimeState): string[] {
+	const ids: string[] = [];
+	for (const [id, entry] of rt.entries) {
 		if (entry.replacement === undefined) {
-			n++;
+			ids.push(id);
 		}
 	}
-	return n;
+	return ids;
 }
 
 /**
- * Decide whether the steering reminder should fire on this turn, given the
- * current runtime state (pending markers) and steering state (turn count +
- * latch).
+ * Observe the current pending count and decide whether a steering reminder
+ * should fire on this LLM call.
  *
- * Conditions (all must hold):
- * - `configEnabled` — the feature is not disabled via env.
- * - `!state.fired` — has not already fired this round (at-most-once).
- * - `unreplaced > 0` — there is at least one marked result still un-replaced;
- *   with nothing to act on, a reminder is just noise.
- * - `state.turnsWithPending >= turnThreshold` — the agent has had enough
- *   turns of opportunity to act on the markers and has not.
+ * Band `k = floor(count / multiple)`. Fires exactly when the count enters a
+ * band strictly above the announced one — i.e. once per band crossing. When
+ * the count drops below the announced band (the agent replaced results), the
+ * band follows it down silently: a later re-grown pile is nagged again.
  *
- * This is a pure predicate. The caller is responsible for incrementing
- * `turnsWithPending` (via `observeTurn`) and setting `state.fired` after a
- * fire (via `markFired`).
+ * Mutates `state.announcedBand` (the tracked band). Returns whether to fire.
+ * With `enabled` false, nothing ever fires and the band is not tracked.
  */
-export function shouldFireSteering(
+export function observePendingBand(
 	state: SteeringState,
-	unreplaced: number,
-	turnThreshold: number,
-	configEnabled: boolean,
+	count: number,
+	multiple: number,
+	enabled: boolean,
 ): boolean {
-	if (!configEnabled || state.fired) {
+	if (!enabled) {
 		return false;
 	}
-	if (unreplaced <= 0) {
-		return false;
+	const band = Math.floor(count / multiple);
+	if (band > state.announcedBand) {
+		state.announcedBand = band;
+		return true;
 	}
-	return state.turnsWithPending >= turnThreshold;
-}
-
-/**
- * Record one observed tool-result-bearing turn. Advances `turnsWithPending`
- * only when there is at least one un-replaced pending marker — so turns with
- * nothing to remind about do not consume the eligibility budget.
- *
- * Returns the new `turnsWithPending` value.
- */
-export function observeTurn(state: SteeringState, unreplaced: number): number {
-	if (unreplaced > 0) {
-		state.turnsWithPending += 1;
+	if (band < state.announcedBand) {
+		state.announcedBand = band;
 	}
-	return state.turnsWithPending;
+	return false;
 }
 
 /**
- * Mark the reminder as fired for this round. Idempotent.
- */
-export function markFired(state: SteeringState): void {
-	state.fired = true;
-}
-
-/**
- * Build the steering reminder text. Single line of user steering, scoped to
- * the current pending set. Kept short and imperative. Aligned with the
- * system-prompt method: extract ALL you may still need into the replacement,
- * then replace — the two failure modes are replacing half-informed (and
- * re-fetching later) and not replacing at all.
+ * Build the steering reminder text: a count summary, the extract-then-replace
+ * method, the anti-hoarding rule ("do not save for just in case"), and the
+ * explicit list of pending ids so the agent can act on them directly in a
+ * single batched `replace_tool_result` call. Kept short and imperative.
  *
- * @param unreplaced - How many marked results are still un-replaced.
+ * @param count - How many marked results are still un-replaced.
+ * @param ids - The pending tool-call ids, in the order reported.
  */
-export function buildSteeringMessage(unreplaced: number): string {
-	const noun = unreplaced === 1 ? "tool result is" : "tool results are";
-	return (
-		`Reminder: ${unreplaced} ${noun} still carrying the ` +
-		`[tool-result-pending-replacement] marker. Per the system instructions, ` +
-		`extract ALL information you may still need from each into its replacement, ` +
-		`then replace them in a single replace_tool_result call before proceeding further.`
-	);
+export function buildSteeringMessage(count: number, ids: string[]): string {
+	const lines = [
+		`Steering: you have ${count} tool-result-pending-replacements — consider distilling their results. ` +
+			`Extract ALL information you may still need from each into its replacement and replace them now, ` +
+			`in a single replace_tool_result call. Do not save a result for just in case: ` +
+			`anything you might need later belongs inside its replacement, and an un-replaced original ` +
+			`keeps costing full context on every call.`,
+	];
+	for (const id of ids) {
+		lines.push(`- ${id}`);
+	}
+	return lines.join("\n");
 }
