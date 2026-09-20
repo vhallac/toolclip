@@ -15,7 +15,7 @@ import { describe, expect, it } from "vitest";
 import toolclip from "../src/toolclip.ts";
 import { createMockApi, invokeHandler, invokeTool } from "./_helpers/mock-pi.ts";
 
-const LONG_TEXT = "x".repeat(9000); // tokenx: 1286 tokens — above the 1000 threshold
+const LONG_TEXT = "x".repeat(9000); // 5776 tokens estimated (tokenx 1286 + 4490 counterweight)
 
 describe("toolclip — smoke integration", () => {
 	it("drives the full flow: marker → replace → swap on next context", async () => {
@@ -34,7 +34,7 @@ describe("toolclip — smoke integration", () => {
 
 		expect(toolResult.content).toHaveLength(2);
 		expect(toolResult.content[1].text).toBe(
-			"[tool-result-pending-replacement: toolCallId=bash-1, tokens=1286]",
+			"[tool-result-pending-replacement: toolCallId=bash-1, tokens=5776]",
 		);
 
 		// 2. Next `context` event includes the tool result message WITH the
@@ -66,7 +66,7 @@ describe("toolclip — smoke integration", () => {
 
 		expect(replaceResult.details).toMatchObject({ ok: true });
 		const rr = (replaceResult.details.results as Array<Record<string, unknown>>)[0];
-		expect(rr.originalTokens).toBe(1286);
+		expect(rr.originalTokens).toBe(5776);
 		expect(rr.replacementTokens).toBe(4); // tokenx("ok, build passed") = 4
 
 		// 4. Next `context` event shows the swap (cache-break point).

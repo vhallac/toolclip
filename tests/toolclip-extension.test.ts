@@ -11,7 +11,7 @@ describe("tool_result handler", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 
-		// tokenx: 1286 tokens — just above the 1000 default.
+		// tokenx: 1286 + 4490 space-free counterweight = 5776 tokens — just above the 1000 default.
 		const longText = "x".repeat(9000);
 		const result = invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
@@ -29,7 +29,7 @@ describe("tool_result handler", () => {
 		expect(content[0].text).toBe(longText);
 		expect(content[1].type).toBe("text");
 		expect(content[1].text).toMatch(
-			/^\[tool-result-pending-replacement: toolCallId=read-1, tokens=1286\]$/,
+			/^\[tool-result-pending-replacement: toolCallId=read-1, tokens=5776\]$/,
 		);
 	});
 
@@ -37,8 +37,9 @@ describe("tool_result handler", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 
-		// tokenx: 72 tokens — well below the 1000 default. Small
-		// results are too cheap to distill; marking them wastes budget.
+		// tokenx: 72 + 240 space-free counterweight = 312 tokens — well below
+		// the 1000 default. Small results are too cheap to distill; marking
+		// them wastes budget.
 		const shortText = "x".repeat(500);
 		const result = invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
@@ -58,7 +59,7 @@ describe("tool_result handler", () => {
 		try {
 			toolclip(pi as never);
 
-			// tokenx: 143 tokens > 100 threshold → marked.
+			// tokenx: 143 + 490 space-free counterweight = 633 tokens > 100 threshold → marked.
 			const shortText = "x".repeat(1000);
 			const result = invokeHandler(handlers, "tool_result", {
 				type: "tool_result",
@@ -71,7 +72,7 @@ describe("tool_result handler", () => {
 			expect(result).toBeDefined();
 			const content = (result as { content: Array<{ type: string; text: string }> }).content;
 			expect(content).toHaveLength(2);
-			expect(content[1].text).toContain("tokens=143");
+			expect(content[1].text).toContain("tokens=633");
 		} finally {
 			if (prev === undefined) {
 				delete process.env.TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS;
@@ -100,9 +101,9 @@ describe("tool_result handler", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 
-		const block1 = "x".repeat(6000);  // tokenx: 858 tokens
-		const block2 = "y".repeat(6004);  // tokenx: 858 tokens
-		// Total: 1716 tokens — above the 1000 default.
+		const block1 = "x".repeat(6000);  // tokenx: 858 + 2990 counterweight = 3848 tokens
+		const block2 = "y".repeat(6004);  // tokenx: 858 + 2992 counterweight = 3850 tokens
+		// Total: 7698 tokens — above the 1000 default.
 		const result = invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "multi-1",
@@ -117,7 +118,7 @@ describe("tool_result handler", () => {
 		expect(result).toBeDefined();
 		const content = (result as { content: Array<{ type: string; text: string }> }).content;
 		expect(content).toHaveLength(3);
-		expect(content[2].text).toContain("tokens=1716");
+		expect(content[2].text).toContain("tokens=7698");
 	});
 
 	it("does not append a marker when the only text is short but present (image blocks ignored)", () => {
@@ -200,7 +201,7 @@ describe("tool_result handler", () => {
 // re-read observation tests (toolclipReread in read-result details)
 // -----------------------------------------------------------------------
 describe("re-read observation (toolclipReread details)", () => {
-	const LONG = "x".repeat(9000); // 1286 tokens — above the 1000 threshold
+	const LONG = "x".repeat(9000); // 5776 tokens estimated — above the 1000 threshold
 	const SHORT = "x".repeat(500); // below the threshold
 
 	function readEvent(toolCallId: string, path: string, text = LONG, extra: Record<string, unknown> = {}) {
@@ -364,7 +365,7 @@ describe("replace_tool_result tool", () => {
 		const { handlers, pi, tools } = createMockApi();
 		toolclip(pi as never);
 
-		// Emit a tool result to create a pending entry (tokenx: 1286 tokens, above threshold)
+		// Emit a tool result to create a pending entry (5776 tokens estimated, above threshold)
 		invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "tool-1",
@@ -380,7 +381,7 @@ describe("replace_tool_result tool", () => {
 		expect(result.details).toMatchObject({ ok: true });
 		const r0 = (result.details.results as Array<Record<string, unknown>>)[0];
 		expect(r0).toMatchObject({ toolCallId: "tool-1", ok: true });
-		expect(r0.originalTokens).toBe(1286);
+		expect(r0.originalTokens).toBe(5776);
 		expect(r0.replacementTokens).toBe(2); // tokenx("short summary")
 		expect(r0.grew).toBe(false);
 	});
@@ -416,7 +417,7 @@ describe("replace_tool_result tool", () => {
 		const { handlers, pi, tools } = createMockApi();
 		toolclip(pi as never);
 
-		// tokenx: 1143 tokens (above threshold)
+		// 5133 tokens estimated (tokenx 1143 + 3990 counterweight) — above threshold
 		invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "tool-grew",
@@ -425,15 +426,15 @@ describe("replace_tool_result tool", () => {
 			isError: false,
 		});
 
-		// tokenx: 1200 tokens > 1143 original — previously hard-failed.
+		// 5390 tokens estimated > 5133 original — previously hard-failed.
 		const result = (await invokeTool(tools, "replace_tool_result", "tool-grew", {
 			items: [{ toolCallId: "tool-grew", replacement: "x".repeat(8400) }],
 		})) as { details: Record<string, unknown> };
 
 		const r0 = (result.details.results as Array<Record<string, unknown>>)[0];
 		expect(r0).toMatchObject({ ok: true });
-		expect(r0.originalTokens).toBe(1143);
-		expect(r0.replacementTokens).toBe(1200);
+		expect(r0.originalTokens).toBe(5133);
+		expect(r0.replacementTokens).toBe(5390);
 		expect(r0.grew).toBe(true);
 	});
 
@@ -449,8 +450,8 @@ describe("replace_tool_result tool", () => {
 			isError: false,
 		});
 
-		// tokenx: 72 tokens vs 1143 original → ratio 0.063, previously
-		// rejected by the 0.1 soft-fail ceiling. Now accepted.
+		// 312 tokens vs 5133 original — accepted (the old 0.1 ratio and the
+		// 1000-token "worth replacing" floor are both gone).
 		const result = (await invokeTool(tools, "replace_tool_result", "tool-soft", {
 			items: [{ toolCallId: "tool-soft", replacement: "y".repeat(500) }],
 		})) as { details: Record<string, unknown> };
@@ -581,7 +582,7 @@ describe("context event handler", () => {
 		const { handlers, pi, tools } = createMockApi();
 		toolclip(pi as never);
 
-		// Emit a long tool result and replace it (tokenx: 1286 tokens, above threshold)
+		// Emit a long tool result and replace it (5776 tokens estimated, above threshold)
 		invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "replaced-1",

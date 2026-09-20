@@ -14,12 +14,17 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import toolclip from "../src/toolclip.ts";
 import { createMockApi, invokeHandler, invokeTool } from "./_helpers/mock-pi.ts";
+import { estimateTokens } from "../lib/tokens.ts";
 
-// tokenx: 14286 tokens — strictly above the 10000 quarantine threshold.
+// 64,276 tokens estimated (tokenx 14286 + 49990 space-free counterweight) —
+// strictly above the 10000 quarantine threshold.
 const QUAR_TEXT = "x".repeat(100000);
-// tokenx: 6000 tokens — below quarantine, above the 1000 pending threshold.
-const PEND_TEXT = "y".repeat(42000);
+// 5776 tokens estimated (tokenx 1286 + 4490 space-free counterweight) —
+// below quarantine, above the 1000 pending threshold.
+const PEND_TEXT = "y".repeat(9000);
 // tokenx: 10000 tokens — exactly at the quarantine threshold (not above).
+// Estimated at well above the default threshold by the counterweight, so the
+// boundary test pins the threshold to the fixture's own estimate.
 const BOUNDARY_TEXT = "z".repeat(70000);
 
 function toolResultEvent(toolCallId: string, text: string, toolName = "bash") {
@@ -48,7 +53,7 @@ describe("toolclip quarantine — tool_result handling", () => {
 
 		expect(result.content).toHaveLength(1); // content swapped, not marker-appended
 		const notice = result.content[0].text;
-		expect(notice).toContain("[tool-result-quarantined: toolCallId=bash-1, tokens=14286]");
+		expect(notice).toContain("[tool-result-quarantined: toolCallId=bash-1, tokens=64276]");
 		expect(notice).toContain("read_quarantined_result");
 		expect(notice).not.toContain(QUAR_TEXT);
 	});
@@ -65,12 +70,20 @@ describe("toolclip quarantine — tool_result handling", () => {
 		expect(result.content).toHaveLength(2);
 		expect(result.content[0].text).toBe(PEND_TEXT); // original intact
 		expect(result.content[1].text).toBe(
-			"[tool-result-pending-replacement: toolCallId=bash-1, tokens=6000]",
+			"[tool-result-pending-replacement: toolCallId=bash-1, tokens=5776]",
 		);
 	});
 
 	it("treats a result exactly at the quarantine threshold as pending, not quarantined", () => {
 		const { handlers, pi } = createMockApi();
+		// The strictness contract is `tokens > threshold` quarantines: a result
+		// at exactly the threshold must stay a pending marker. Pin the
+		// threshold to the fixture's own estimate so the boundary holds
+		// regardless of the estimator's absolute numbers.
+		vi.stubEnv(
+			"TOOLCLIP_QUARANTINE_THRESHOLD_TOKENS",
+			String(estimateTokens(BOUNDARY_TEXT)),
+		);
 		toolclip(pi as never);
 		invokeHandler(handlers, "turn_start", { type: "turn_start", turnIndex: 0, timestamp: 0 });
 
@@ -96,7 +109,7 @@ describe("toolclip quarantine — the one-turn read window", () => {
 			toolCallId: "bash-1",
 		})) as { content: Array<{ type: string; text: string }>; details: Record<string, unknown> };
 
-		expect(read.details).toMatchObject({ ok: true, toolCallId: "bash-1", tokens: 14286 });
+		expect(read.details).toMatchObject({ ok: true, toolCallId: "bash-1", tokens: 64276 });
 		expect(read.content[0].text).toBe(QUAR_TEXT); // full payload returned
 
 		// pi fires tool_result for the read itself: the payload is marked
@@ -109,7 +122,7 @@ describe("toolclip quarantine — the one-turn read window", () => {
 		expect(readResult.content).toHaveLength(2);
 		expect(readResult.content[0].text).toBe(QUAR_TEXT);
 		expect(readResult.content[1].text).toBe(
-			"[tool-result-pending-replacement: toolCallId=read-1, tokens=14286]",
+			"[tool-result-pending-replacement: toolCallId=read-1, tokens=64276]",
 		);
 
 		// The read result is replaceable via the normal mechanism.
