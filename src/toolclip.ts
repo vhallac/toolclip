@@ -304,6 +304,10 @@ export default function toolclip(api: ExtensionAPI): void {
 			"you MUST call `replace_tool_result({ items: [{ toolCallId, replacement }, ...] })` " +
 			"once you have extracted what you need from that result — before you make the next " +
 			"tool call or write your final answer. Batch many replacements into a single call.\n" +
+			"Before you write your final answer, do the sweep. Replace, in a single " +
+			"`replace_tool_result` call, every marked result you have already read but not yet " +
+			"replaced. Having the answer ready is no reason to leave them: if nothing remains " +
+			"marked-and-read, the sweep is a no-op — say so in one line and then answer.\n" +
 			"- Replacement is a completion step of extraction, not optional cleanup. The trigger " +
 			"  is simple: once you have captured the relevant information from a marked result " +
 			"  into your reasoning or into your replacement, that result is spent — replace it now.\n" +

@@ -734,6 +734,12 @@ describe("before_agent_start handler", () => {
 			"Do not let size become a reason to keep the full original around",
 		);
 		expect(result.systemPrompt).toContain("replace it before moving on");
+		// The pre-answer sweep gate (option B) is present.
+		expect(result.systemPrompt).toContain("Before you write your final answer, do the sweep");
+		expect(result.systemPrompt).toContain(
+			"Having the answer ready is no reason to leave them",
+		);
+		expect(result.systemPrompt).toContain("the sweep is a no-op");
 		// Size-gate language was removed — these phrases must NOT appear.
 		expect(result.systemPrompt).not.toContain("strictly shorter than the original");
 		expect(result.systemPrompt).not.toContain("configured ratio");
