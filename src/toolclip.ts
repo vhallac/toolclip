@@ -515,6 +515,15 @@ export default function toolclip(api: ExtensionAPI): void {
 			"  full re-read, an included one costs a line.\n" +
 			"- Drop verbose output such as file contents, full directory listings, or exhaustive " +
 			"  search results as soon as you have extracted the relevant parts.\n" +
+			"- A result that turns out to be useless is not an exception to this rule — it is the " +
+			"  most important one to replace. If you read a result and it contained nothing you did " +
+			"  not already know or need (it only confirmed what you already knew, or it is machine " +
+			"  noise such as base64, hashes, or dump listings), then \"there was nothing to " +
+			"  extract\" IS the extraction result, not a reason to defer: replace it immediately " +
+			"  with one or two lines stating what the call checked and what it did and did not find " +
+			"  (e.g. \"index.csv head: rows are <id>,<base64 embedding>,<label> — no task-relevant " +
+			"  content\"). An un-replaced useless result keeps costing its full size on every later " +
+			"  call while contributing nothing.\n" +
 			"- Do NOT keep a result because you might quote it later. If you will reference a " +
 			"  specific excerpt, put that excerpt into the replacement now and replace the " +
 			"  whole result — do not park the full original for later quoting.\n" +

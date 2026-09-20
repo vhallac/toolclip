@@ -1021,6 +1021,12 @@ describe("before_agent_start handler", () => {
 			"Having the answer ready is no reason to leave them",
 		);
 		expect(result.systemPrompt).toContain("the sweep is a no-op");
+		// Useless results are replaced too: "nothing to extract" is the
+		// extraction result, not a reason to defer.
+		expect(result.systemPrompt).toContain("most important one to replace");
+		expect(result.systemPrompt).toContain(
+			"what the call checked and what it did and did not find",
+		);
 		// Size-gate language was removed — these phrases must NOT appear.
 		expect(result.systemPrompt).not.toContain("strictly shorter than the original");
 		expect(result.systemPrompt).not.toContain("configured ratio");
