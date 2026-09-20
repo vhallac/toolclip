@@ -226,6 +226,10 @@ describe("toolclip quarantine — system prompt", () => {
 		expect(result.systemPrompt).toContain("above 10000 tokens");
 		expect(result.systemPrompt).toContain("read_quarantined_result");
 		expect(result.systemPrompt).toContain("narrower scope");
+		// Anti-piecemeal directive: read the whole payload from the quarantine
+		// instead of reconstructing it with partial fetches.
+		expect(result.systemPrompt).toContain("read it from the quarantine — do NOT reconstruct it");
+		expect(result.systemPrompt).toContain("offset/limit chunks");
 	});
 });
 

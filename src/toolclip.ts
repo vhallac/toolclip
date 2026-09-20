@@ -28,7 +28,9 @@
  * turn ("use it or lose it"), retrievable via the registered
  * `read_quarantined_result` tool. The read's own result re-enters the
  * normal pending-marker path (it is replaceable), never re-quarantined —
- * that would be a loop.
+ * that would be a loop. Both the notice and the system-prompt section tell
+ * the model to read the held payload in full when it needs all of it —
+ * never to reconstruct it piecemeal with several narrowed calls.
  *
  * The `context` event does the actual swap before each LLM call.
  *
@@ -369,13 +371,17 @@ export default function toolclip(api: ExtensionAPI): void {
 			"Know the trade-off before you call: the entire payload re-enters your context at full " +
 			"token cost, and you can only do this in the response immediately after the " +
 			"[tool-result-quarantined: ...] notice — the data is freed right after that response, " +
-			"and later calls for the id are denied. Prefer re-issuing a narrower version of the " +
-			"original tool call instead of reading.",
+			"and later calls for the id are denied. If you need only part of the data, prefer " +
+			"re-issuing a narrower version of the original tool call instead of reading. If you " +
+			"need the whole payload, read it here once — do NOT reconstruct it piecemeal with " +
+			"several narrowed calls; that costs more than one full read.",
 		promptSnippet:
 			"`read_quarantined_result({ toolCallId })` returns a tool result that was withheld " +
 			"as too large. Call it only in your immediately next response, and only when the full " +
 			"payload is truly needed — the quarantine is freed afterwards and the call is then " +
-			"denied. Prefer narrowing the original tool call instead.",
+			"denied. When you do need it all, read it in one call rather than fetching the " +
+			"content in pieces; prefer narrowing the original tool call only when part of the " +
+			"data suffices.",
 		parameters: Type.Object({
 			toolCallId: Type.String({
 				description:
@@ -465,6 +471,10 @@ export default function toolclip(api: ExtensionAPI): void {
 			"  `read_quarantined_result({ toolCallId: \"...\" })` in your immediately next response. That " +
 			"  is the only window: once that response ends, the payload is freed and read attempts for " +
 			"  it are denied.\n" +
+			"- If you need the whole payload, read it from the quarantine — do NOT reconstruct it " +
+			"  piecemeal (e.g. reading a large file in offset/limit chunks, or re-running the call " +
+			"  several times with narrower scopes). Several partial fetches cost more calls and more " +
+			"  tokens than one full read.\n" +
 			"- Reading is costly: the whole payload returns to your context at full size. If you do " +
 			"  read it, treat it like any other large result — extract what you need and replace it " +
 			"  promptly via replace_tool_result.\n";

@@ -32,6 +32,8 @@ The LLM is the only actor. There is no auto-summarizer and no auto-eviction. The
    ```
    and the payload is held aside for exactly one turn — use it or lose it. The agent first sees the notice in the turn after the quarantine (pi delivers a turn's tool results at that turn's end, so it cannot react within the same turn); a `read_quarantined_result({ toolCallId })` call issued in that next turn is honored — even as one of several tool calls in the batch. At the turn_end that closes the window, unread payloads are freed and later read attempts are denied with a `[quarantine-missed: ...]` notice. The read's own result re-enters the normal pending-marker path (it is replaceable), and is never re-quarantined. Held payloads never survive a round boundary.
 
+   Both the notice and the system-prompt section frame the choice as part-vs-whole: need only part of the data → re-issue a narrower call; need the whole payload → read it from the quarantine **once**. Reconstructing the payload piecemeal (offset/limit chunks, repeated narrowed calls) costs more calls and more tokens than one full read and is explicitly forbidden.
+
 ## Configuration
 
 | Env var | Default | Meaning |

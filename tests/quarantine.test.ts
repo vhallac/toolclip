@@ -112,8 +112,14 @@ describe("quarantine notices", () => {
 		expect(notice).toContain('read_quarantined_result({ toolCallId: "abc-1" })');
 		expect(notice).toContain("your very next response");
 		expect(notice).toContain("later read attempts for it are denied");
-		// The preferred path (refining the call) is stated before the read.
+		// The part-of-data path (narrowing the call) is stated before the read.
 		expect(notice.indexOf("narrower scope")).toBeLessThan(notice.indexOf("read_quarantined_result"));
+		// Anti-piecemeal directive: whole payload → one full read, never
+		// several narrowed calls (the distill-refetch failure observed in the
+		// 2026-09-20 pro golden run).
+		expect(notice).toContain("If you need the whole payload");
+		expect(notice).toContain("Do NOT reconstruct the payload piecemeal");
+		expect(notice).toContain("more calls and more tokens than one full read");
 	});
 
 	it("the missed notice denies further retrieval and points back to a narrower re-run", () => {

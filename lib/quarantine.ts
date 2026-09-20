@@ -94,9 +94,10 @@ export function evictExpiredQuarantines(
 
 /**
  * Build the notice swapped into a quarantined result's LLM-facing content.
- * Carries the marker (parseable identity) plus the guidance: prefer
- * narrowing the tool call; the read is a single-turn, use-it-or-lose-it
- * escape hatch.
+ * Carries the marker (parseable identity) plus the guidance: narrow the
+ * call when only part of the data is needed; read the held payload once,
+ * in full, when all of it is needed — never reconstruct it piecemeal with
+ * several narrowed calls (that costs more than one read).
  *
  * @param toolCallId - The tool call id whose result was withheld.
  * @param tokens - Estimated token count of the held payload.
@@ -105,9 +106,9 @@ export function buildQuarantineNotice(toolCallId: string, tokens: number): strin
 	return (
 		buildQuarantinedMarker(toolCallId, tokens) +
 		"\n" +
-		"This result was withheld from your context (too large). Two options, in order of preference:\n" +
-		`1. Preferred: do not retrieve it. Re-issue the original tool call with a narrower scope so the result comes back small.\n` +
-		`2. Only if the full payload is genuinely needed: call read_quarantined_result({ toolCallId: "${toolCallId}" }) in your very next response. ` +
+		"This result was withheld from your context (too large). Choose deliberately:\n" +
+		"1. If you only need part of the data: re-issue the tool call with a narrower scope (specific file, tighter pattern, smaller range) so the result comes back small.\n" +
+		`2. If you need the whole payload: call read_quarantined_result({ toolCallId: "${toolCallId}" }) once, in your very next response. Do NOT reconstruct the payload piecemeal with several narrowed calls — that costs more calls and more tokens than one full read.\n` +
 		"This is your only chance — the held data is freed right after that response, and later read attempts for it are denied."
 	);
 }
