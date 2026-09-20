@@ -868,3 +868,96 @@ describe("divisor calibration", () => {
 		}
 	});
 });
+
+// -----------------------------------------------------------------------
+// calibration scope + clamp (golden-sample regression) tests
+// -----------------------------------------------------------------------
+describe("divisor calibration scope and clamp", () => {
+	it("uses input + cacheRead + cacheWrite as the denominator", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+
+		// 4000 message chars snapshotted for the prompt.
+		invokeHandler(handlers, "context", {
+			type: "context",
+			messages: [{ role: "user", content: [{ type: "text", text: "y".repeat(4000) }] }],
+		});
+
+		// The provider reports input=500 with 1400 cached-read and 100
+		// cache-write tokens. input alone would give an observed divisor of 8
+		// (4000/500); the TOTAL prompt is 2000 tokens → true divisor 2.
+		invokeHandler(handlers, "message_end", {
+			type: "message_end",
+			message: {
+				role: "assistant",
+				usage: { input: 500, cacheRead: 1400, cacheWrite: 100 },
+			},
+		});
+
+		// Marker must use divisor 2 → ceil(4000/2) = 2000 tokens.
+		const result = invokeHandler(handlers, "tool_result", {
+			type: "tool_result",
+			toolCallId: "bash-cache",
+			toolName: "bash",
+			content: [{ type: "text", text: "x".repeat(4000) }],
+			isError: false,
+		});
+		const content = (result as { content: Array<{ type: string; text: string }> }).content;
+		expect(content[1].text).toMatch(
+			/^\[tool-result-pending-replacement: toolCallId=bash-cache, tokens=2000\]$/,
+		);
+	});
+
+	it("counts the system prompt + tool defs in the numerator, and clamps at MAX", () => {
+		const { handlers, pi } = createMockApi();
+		// A huge system prompt (and a tool schema); the inactive tool must be
+		// excluded from the overhead.
+		pi.getActiveTools = () => ["read"];
+		pi.getAllTools = () => [
+			{
+				name: "read",
+				description: "d".repeat(500),
+				parameters: { type: "object" },
+			},
+			{
+				name: "inactive-tool",
+				description: "z".repeat(100000),
+				parameters: {},
+			},
+		] as never;
+		toolclip(pi as never);
+
+		// Round starts with a 100k-char system prompt → overhead ≥ 100k.
+		invokeHandler(handlers, "before_agent_start", {
+			type: "before_agent_start",
+			systemPrompt: "S".repeat(100000),
+		});
+
+		// 4000 message chars against 1000 total tokens → observed ≥ 104
+		// without overhead accounting; with overhead included the observed
+		// ratio is far above 8, so the clamp must hold the divisor at MAX.
+		invokeHandler(handlers, "context", {
+			type: "context",
+			messages: [{ role: "user", content: [{ type: "text", text: "y".repeat(4000) }] }],
+		});
+		invokeHandler(handlers, "message_end", {
+			type: "message_end",
+			message: { role: "assistant", usage: { input: 1000 } },
+		});
+
+		// Divisor 8 → ceil(9000/8) = 1125 tokens (a divisor-4 estimate would
+		// have produced 2250, and without overhead accounting divisor 4 would
+		// apply to 4000 chars → 1000 → no marker at all).
+		const result = invokeHandler(handlers, "tool_result", {
+			type: "tool_result",
+			toolCallId: "bash-overhead",
+			toolName: "bash",
+			content: [{ type: "text", text: "x".repeat(9000) }],
+			isError: false,
+		});
+		const content = (result as { content: Array<{ type: string; text: string }> }).content;
+		expect(content[1].text).toMatch(
+			/^\[tool-result-pending-replacement: toolCallId=bash-overhead, tokens=1125\]$/,
+		);
+	});
+});

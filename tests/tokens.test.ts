@@ -5,9 +5,12 @@ import {
 	countMessagesChars,
 	createCalibrator,
 	setSnapshotChars,
+	setOverheadChars,
 	observeTokens,
 	getDivisor,
 	DEFAULT_DIVISOR,
+	MAX_CALIBRATED_DIVISOR,
+	MIN_CALIBRATED_DIVISOR,
 } from "../lib/tokens.ts";
 
 describe("estimateTokens", () => {
@@ -78,6 +81,32 @@ describe("createCalibrator", () => {
 		const cal = createCalibrator(3);
 		expect(cal.divisor).toBe(3);
 	});
+
+	it("starts with zero overhead chars", () => {
+		const cal = createCalibrator();
+		expect(cal.overheadChars).toBe(0);
+	});
+});
+
+describe("setOverheadChars", () => {
+	it("records the constant prompt part (system prompt + tool defs)", () => {
+		const cal = createCalibrator(4);
+		setOverheadChars(cal, 6000);
+		expect(cal.overheadChars).toBe(6000);
+		// Numerator = 4000 message chars + 6000 overhead = 10000; against
+		// 1000 tokens the observed divisor is 10 → clamped at MAX.
+		expect(observeTokens(cal, 4000, 1000)).toBe(MAX_CALIBRATED_DIVISOR);
+	});
+
+	it("ignores non-finite or negative overhead", () => {
+		const cal = createCalibrator(4);
+		setOverheadChars(cal, Number.NaN);
+		expect(cal.overheadChars).toBe(0);
+		setOverheadChars(cal, -5);
+		expect(cal.overheadChars).toBe(0);
+		setOverheadChars(cal, 2000);
+		expect(cal.overheadChars).toBe(2000);
+	});
 });
 
 describe("observeTokens", () => {
@@ -111,6 +140,46 @@ describe("observeTokens", () => {
 		expect(observeTokens(cal, Number.NaN, 1000)).toBe(4);
 		expect(observeTokens(cal, 4000, Number.NaN)).toBe(4);
 		expect(cal.sampleCount).toBe(0);
+	});
+
+	it("counts chars + overhead in the numerator", () => {
+		const cal = createCalibrator(4);
+		setOverheadChars(cal, 4000);
+		// (4000 messages + 4000 overhead) / 2000 tokens → observed 4, matching
+		// the current divisor → blend is a no-op at alpha = 1.
+		expect(observeTokens(cal, 4000, 2000)).toBeCloseTo(4, 10);
+	});
+});
+
+describe("divisor clamp", () => {
+	it("clamps a scope-mismatched low sample at MIN (the golden-sample 0.4 failure)", () => {
+		const cal = createCalibrator(4);
+		// The golden-sample failure: 957 message chars paired with 2393
+		// prompt tokens (system + tools included) → observed ~0.4, which the
+		// old code latched for the whole session (10x overestimates, a
+		// false-positive quarantine). The clamp now holds the divisor at 2.
+		expect(observeTokens(cal, 957, 2393)).toBe(MIN_CALIBRATED_DIVISOR);
+		expect(getDivisor(cal)).toBe(MIN_CALIBRATED_DIVISOR);
+	});
+
+	it("clamps a runaway high sample at MAX", () => {
+		const cal = createCalibrator(4);
+		// The other golden-sample failure mode: full-history chars paired
+		// with non-cached-only tokens → observed ratios of 10–75.
+		expect(observeTokens(cal, 40000, 1000)).toBe(MAX_CALIBRATED_DIVISOR);
+		expect(getDivisor(cal)).toBe(MAX_CALIBRATED_DIVISOR);
+	});
+
+	it("recovers from a clamped sample as good samples arrive", () => {
+		const cal = createCalibrator(4);
+		observeTokens(cal, 957, 2393); // poisoned → clamped to 2
+		// True divisor 4: first good sample alpha = 1/2 → 2*0.5 + 4*0.5 = 3.
+		expect(observeTokens(cal, 4000, 1000)).toBeCloseTo(3, 10);
+	});
+
+	it("keeps in-range samples untouched", () => {
+		const cal = createCalibrator(4);
+		expect(observeTokens(cal, 4000, 1000)).toBeCloseTo(4, 10);
 	});
 });
 

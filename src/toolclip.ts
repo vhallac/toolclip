@@ -58,6 +58,7 @@ import {
 	countMessagesChars,
 	createCalibrator,
 	setSnapshotChars,
+	setOverheadChars,
 	observeTokens,
 	getDivisor,
 } from "../lib/tokens.ts";
@@ -435,8 +436,6 @@ export default function toolclip(api: ExtensionAPI): void {
 		// quarantines are already evicted by the turn_end that closes their
 		// one-turn window — this covers aborted runs that never reached it.
 		clearQuarantines(state);
-
-
 		const toolclipInstructions =
 			"\n## Tool Result Replacement\n" +
 			"When a long tool result has a [tool-result-pending-replacement: ...] marker, " +
@@ -477,6 +476,33 @@ export default function toolclip(api: ExtensionAPI): void {
 			"- Reading is costly: the whole payload returns to your context at full size. If you do " +
 			"  read it, treat it like any other large result — extract what you need and replace it " +
 			"  promptly via replace_tool_result.\n";
+
+		// Calibration scope: the denominator (total prompt tokens) covers the
+		// system prompt and the serialized tool definitions, which are absent
+		// from the messages array the `context` handler snapshots. Record their
+		// character counts as the calibrator's overhead so both sides of the
+		// ratio cover the same scope. event.systemPrompt is the fully assembled
+		// prompt for this round BEFORE our appended instructions.
+		let toolDefChars = 0;
+		if (typeof api.getAllTools === "function" && typeof api.getActiveTools === "function") {
+			const active = new Set(api.getActiveTools());
+			for (const tool of api.getAllTools()) {
+				if (!active.has(tool.name)) {
+					continue;
+				}
+				toolDefChars += JSON.stringify({
+					name: tool.name,
+					description: tool.description,
+					parameters: tool.parameters,
+				}).length;
+			}
+		}
+		setOverheadChars(
+			calibrator,
+			(typeof event.systemPrompt === "string" ? event.systemPrompt.length : 0) +
+				toolclipInstructions.length +
+				toolDefChars,
+		);
 
 		return {
 			systemPrompt: event.systemPrompt + toolclipInstructions,
@@ -543,25 +569,39 @@ export default function toolclip(api: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 	// 5. message_end event handler — calibrate the token-estimator divisor.
 	//
-	//    Each assistant message carries the model's actual `usage.input` for
-	//    the prompt that produced it. We already snapped that prompt's
-	//    character count in the preceding `context` handler, so here we blend
-	//    the observed chars-per-token ratio into the running divisor (EMA).
+	//    Each assistant message carries the model's usage for the prompt that
+	//    produced it. We already snapped that prompt's character count in the
+	//    preceding `context` handler, so here we blend the observed
+	//    chars-per-token ratio into the running divisor (EMA).
+	//
+	//    Scope fix: providers report `usage.input` as ONLY the non-cached
+	//    portion of the prompt (pi-ai normalizes OpenAI-completions usage as
+	//    `input = prompt_tokens − cached − cache_write`); cached tokens ride
+	//    in `usage.cacheRead` / `usage.cacheWrite`. Pairing snapshotChars
+	//    (the whole history) with `input` alone made the observed ratio
+	//    explode as the cache grew — the divisor ratcheted from 4 to ~35 in
+	//    the golden-sample session. The denominator is therefore the TOTAL
+	//    prompt tokens: input + cacheRead + cacheWrite.
+	//
 	//    Only assistant messages have `usage`; user/toolResult messages are
 	//    ignored. Degenerate samples (zero/non-finite chars or tokens) are
-	//    skipped by `observeTokens`.
+	//    skipped by `observeTokens`; the blended result is clamped to [2, 8].
 	// -----------------------------------------------------------------------
 	api.on("message_end", (event: MessageEndEvent) => {
-		const usage = (event.message as { usage?: { input?: unknown } }).usage;
-		const input = usage?.input;
-		if (typeof input !== "number" || config.calibrate === false) {
+		const usage = (
+			event.message as { usage?: { input?: unknown; cacheRead?: unknown; cacheWrite?: unknown } }
+		).usage;
+		if (!usage || typeof usage.input !== "number" || config.calibrate === false) {
 			return;
 		}
+		const input = usage.input;
+		const cacheRead = typeof usage.cacheRead === "number" ? usage.cacheRead : 0;
+		const cacheWrite = typeof usage.cacheWrite === "number" ? usage.cacheWrite : 0;
 		const snapshotChars = calibrator.latestChars;
 		if (snapshotChars === null) {
 			return;
 		}
-		observeTokens(calibrator, snapshotChars, input);
+		observeTokens(calibrator, snapshotChars, input + cacheRead + cacheWrite);
 	});
 
 	// -----------------------------------------------------------------------

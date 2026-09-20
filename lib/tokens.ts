@@ -4,8 +4,19 @@
  * The raw heuristic is `chars / divisor` with a default divisor of 4
  * (chars/4 — the same estimate sesclip uses). The divisor can be calibrated
  * against the model's real token counts: each turn we compare the character
- * count of the full context against pi's reported `usage.input`, turning the
- * observed chars-per-token ratio into an EMA-adjusted divisor.
+ * count of the prompt against pi's reported usage, turning the observed
+ * chars-per-token ratio into an EMA-adjusted divisor.
+ *
+ * Scope pairing matters: providers report `usage.input` as only the
+ * non-cached portion of the prompt (cached tokens ride in `usage.cacheRead`
+ * / `usage.cacheWrite`), and the prompt includes the system prompt and tool
+ * definitions, which are absent from the `messages` array. The caller must
+ * therefore pass the TOTAL prompt tokens (`input + cacheRead + cacheWrite`)
+ * as `actualTokens`, and record the prompt's constant part (system prompt +
+ * tool definition chars) via `setOverheadChars` so the numerator covers the
+ * same scope as the denominator. The blended divisor is clamped to
+ * [MIN_CALIBRATED_DIVISOR, MAX_CALIBRATED_DIVISOR] so a single bad sample
+ * cannot push estimates out of a sane range.
  *
  * Calibration is per-session and ephemeral. It does not persist — persisting
  * the calibrated divisor is a documented future improvement.
@@ -13,6 +24,23 @@
 
 /** Baseline chars-per-token heuristic used as the starting divisor. */
 export const DEFAULT_DIVISOR = 4;
+
+/**
+ * Hard lower bound for the calibrated divisor. Real prompts rarely run
+ * below ~3 chars/token (code with dense punctuation can approach 3);
+ * anything below 2 means the sample's scope was mismatched — clamp rather
+ * than let one bad sample inflate every later estimate 10x.
+ */
+export const MIN_CALIBRATED_DIVISOR = 2;
+
+/**
+ * Hard upper bound for the calibrated divisor. Natural-language-heavy
+ * contexts stay below ~5 chars/token; above 8 the sample is again
+ * suspect. If calibration keeps pinning at this boundary, the sample
+ * pairing itself is wrong (that is the signal to switch to delta
+ * calibration).
+ */
+export const MAX_CALIBRATED_DIVISOR = 8;
 
 /**
  * Estimate the token count of a single text string.
@@ -114,6 +142,13 @@ export interface Calibrator {
 	latestChars: number | null;
 	/** Number of calibration samples blended so far. */
 	sampleCount: number;
+	/**
+	 * Character count of the constant prompt part that is NOT in the
+	 * messages array: the system prompt plus the serialized tool
+	 * definitions. Added to every numerator so it covers the same scope as
+	 * the total-prompt-token denominator.
+	 */
+	overheadChars: number;
 }
 
 /**
@@ -123,7 +158,19 @@ export interface Calibrator {
  *                         `DEFAULT_DIVISOR`.
  */
 export function createCalibrator(initialDivisor: number = DEFAULT_DIVISOR): Calibrator {
-	return { divisor: initialDivisor, latestChars: null, sampleCount: 0 };
+	return { divisor: initialDivisor, latestChars: null, sampleCount: 0, overheadChars: 0 };
+}
+
+/**
+ * Record the constant prompt part outside the messages array (system
+ * prompt + serialized tool definitions, in characters). Non-finite or
+ * negative values are ignored.
+ */
+export function setOverheadChars(cal: Calibrator, chars: number): void {
+	if (!Number.isFinite(chars) || chars < 0) {
+		return;
+	}
+	cal.overheadChars = chars;
 }
 
 /**
@@ -137,11 +184,20 @@ export function setSnapshotChars(cal: Calibrator, chars: number): void {
 /**
  * Blend one observation of `(chars, actualTokens)` into the divisor via EMA.
  *
- * The observed divisor for this sample is `chars / actualTokens`. Guards
- * skip degenerate samples: a zero or non-finite `chars` or `actualTokens`
- * yields no change. The EMA weight starts at 1/2 and decays toward a floor
- * of 1/31 as `sampleCount` grows, so early turns adapt quickly and later
- * turns only nudge the divisor.
+ * `chars` is the character count of the messages array for the prompt that
+ * produced `actualTokens`; the calibrator adds `overheadChars` (system
+ * prompt + tool definitions) so the numerator covers the same scope as the
+ * denominator. `actualTokens` must be the TOTAL prompt tokens for that
+ * call — for OpenAI-completions-style providers that is
+ * `usage.input + usage.cacheRead + usage.cacheWrite`, since `usage.input`
+ * alone excludes cached tokens.
+ *
+ * The observed divisor for this sample is `promptChars / actualTokens`.
+ * Guards skip degenerate samples: a zero or non-finite `chars` or
+ * `actualTokens` yields no change. The EMA weight starts at 1/2 and decays
+ * toward a floor of 1/31 as `sampleCount` grows, so early turns adapt
+ * quickly and later turns only nudge the divisor. The blended result is
+ * clamped to [MIN_CALIBRATED_DIVISOR, MAX_CALIBRATED_DIVISOR].
  *
  * @returns The updated divisor (equal to the previous one if the sample was
  *          skipped).
@@ -154,13 +210,18 @@ export function observeTokens(
 	if (!Number.isFinite(chars) || !Number.isFinite(actualTokens)) {
 		return cal.divisor;
 	}
-	if (chars <= 0 || actualTokens <= 0) {
+	const promptChars = chars + cal.overheadChars;
+	if (promptChars <= 0 || actualTokens <= 0) {
 		return cal.divisor;
 	}
 
-	const observedDivisor = chars / actualTokens;
+	const observedDivisor = promptChars / actualTokens;
 	const alpha = 1 / Math.min(cal.sampleCount + 1, 30);
-	cal.divisor = cal.divisor * (1 - alpha) + observedDivisor * alpha;
+	const blended = cal.divisor * (1 - alpha) + observedDivisor * alpha;
+	cal.divisor = Math.min(
+		MAX_CALIBRATED_DIVISOR,
+		Math.max(MIN_CALIBRATED_DIVISOR, blended),
+	);
 	cal.sampleCount = Math.min(cal.sampleCount + 1, 99);
 	return cal.divisor;
 }
