@@ -16,6 +16,7 @@ The extension lives at `src/toolclip.ts` and follows the Semblr split: a thin pi
 - Registers a `replace_tool_result(toolCallId, replacement)` tool the LLM can call at its leisure. **No length gate is applied** — replacements of any size are accepted, and the tool records a `grew` flag (`replacementTokens >= originalTokens`) in its details as the observation target for reintroducing a gate later.
 - Listens to the `context` event; before each LLM call, swaps any `ToolResultMessage` whose `toolCallId` has a stored replacement to `[replacement]\n[tool-result-replaced: toolCallId=id]`. This is the cache-break point — known and accepted.
 - Injects a **steering reminder**: a single trailing `user` message, at most once per round, when the agent has left marked results un-replaced for several turns. It is appended to the *end* of the context (pi's standard steering path), so the cached prefix is never touched. Reset at each round boundary in `before_agent_start`.
+- **Quarantines** results strictly above `quarantineThresholdTokens` (default 10000) at `tool_result` time: content swapped for a `[tool-result-quarantined: toolCallId=id, tokens=N]` notice, payload held in the quarantine store. Registers `read_quarantined_result(toolCallId)` — a single-turn escape hatch. The read window is the turn after the quarantine (pi delivers a turn's tool results at that turn's `turn_end`, so the LLM cannot react within the creating turn); reads execute during the window and are honored even among several tool calls in the batch. At the `turn_end` closing the window (`createdTurn <= turnIndex - 1`), unread payloads are evicted — later reads are denied with `[quarantine-missed: toolCallId=id]`. The read's own result flows down the normal pending-marker path (replaceable, never re-quarantined). Held payloads never survive a round boundary (`before_agent_start` clears defensively, e.g. after aborted runs).
 - Injects system-prompt instructions explaining the marker and the tool. If the LLM never calls the tool, the original result stays.
 
 ## Target Project Structure
@@ -23,7 +24,7 @@ The extension lives at `src/toolclip.ts` and follows the Semblr split: a thin pi
 - `README.md` — overview, limits, usage, behavior
 - `AGENTS.md` — this file
 - `src/toolclip.ts` — thin extension entrypoint
-- `lib/` — config, token estimator, marker, runtime state, steering, shared types
+- `lib/` — config, token estimator, marker, runtime state, steering, quarantine, shared types
 - `tests/` — unit and integration tests
 - `eval/` — golden-spec runners and runs (mirrors sesclip)
 - `doc/` — design notes, prompt contracts, architecture
@@ -37,6 +38,8 @@ The extension lives at `src/toolclip.ts` and follows the Semblr split: a thin pi
 | `TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS` | `1000` | Minimum estimated token count for a tool result to get a pending marker. Results at or below the threshold are left untouched — too small for distillation to pay off. |
 | `TOOLCLIP_STEERING_REMINDER` | `true` | Whether to inject the once-per-round steering reminder when marked results stay un-replaced. |
 | `TOOLCLIP_STEERING_REMINDER_TURN` | `3` | Minimum number of tool-result-bearing turns (with an un-replaced marker present) before the reminder becomes eligible. Fires at most once per round. |
+| `TOOLCLIP_QUARANTINE` | `true` | Whether oversized results are quarantined (payload held for one turn, retrievable via `read_quarantined_result`). Disable to fall back to plain pending markers for all sizes. |
+| `TOOLCLIP_QUARANTINE_THRESHOLD_TOKENS` | `10000` | Minimum estimated token count for a tool result to be quarantined. Must sit well above the pending threshold. |
 
 The max-replacement-ratio gate is intentionally **not** reintroduced: `replace_tool_result` accepts a replacement of any size and records a `grew` flag when a replacement is at least as large as its original — the observation target for reintroducing a length gate later.
 

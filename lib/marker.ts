@@ -28,6 +28,10 @@ const PENDING_PREFIX = "[tool-result-pending-replacement:";
 const PENDING_SUFFIX = "]";
 const REPLACED_PREFIX = "[tool-result-replaced:";
 const REPLACED_SUFFIX = "]";
+const QUARANTINED_PREFIX = "[tool-result-quarantined:";
+const QUARANTINED_SUFFIX = "]";
+const MISSED_PREFIX = "[quarantine-missed:";
+const MISSED_SUFFIX = "]";
 
 /**
  * Build the pending-replacement marker.
@@ -49,6 +53,32 @@ export function buildPendingMarker(toolCallId: string, tokens: number): string {
  */
 export function buildReplacedMarker(toolCallId: string): string {
 	return `${REPLACED_PREFIX} toolCallId=${toolCallId}${REPLACED_SUFFIX}`;
+}
+
+/**
+ * Build the quarantined marker (the notice swapped into an oversized tool
+ * result's content in place of the payload).
+ *
+ * @param toolCallId - The tool call id whose result was quarantined.
+ * @param tokens - The estimated token count of the held payload.
+ * @returns The marker string, e.g.
+ *          `[tool-result-quarantined: toolCallId=abc, tokens=12000]`.
+ */
+export function buildQuarantinedMarker(toolCallId: string, tokens: number): string {
+	return `${QUARANTINED_PREFIX} toolCallId=${toolCallId}, tokens=${tokens}${QUARANTINED_SUFFIX}`;
+}
+
+/**
+ * Build the quarantine-missed marker, returned to the LLM when a
+ * `read_quarantined_result` call targets an id that is no longer held
+ * (already read, or its one-turn window expired).
+ *
+ * @param toolCallId - The id that was requested.
+ * @returns The marker string, e.g.
+ *          `[quarantine-missed: toolCallId=abc]`.
+ */
+export function buildQuarantineMissedMarker(toolCallId: string): string {
+	return `${MISSED_PREFIX} toolCallId=${toolCallId}${MISSED_SUFFIX}`;
 }
 
 interface ParsedPendingMarker {

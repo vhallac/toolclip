@@ -9,6 +9,8 @@ describe("loadToolclipConfig", () => {
 			steeringReminderTurn: 3,
 			calibrate: true,
 			calibratorInitialDivisor: 4,
+			quarantine: true,
+			quarantineThresholdTokens: 10000,
 		});
 	});
 
@@ -76,6 +78,8 @@ describe("loadToolclipConfig", () => {
 			steeringReminderTurn: 3,
 			calibrate: true,
 			calibratorInitialDivisor: 4,
+			quarantine: true,
+			quarantineThresholdTokens: 10000,
 		});
 	});
 

@@ -20,7 +20,7 @@ import type { ToolclipRuntimeState } from "./types.ts";
  * Create a fresh, empty runtime state.
  */
 export function createRuntimeState(): ToolclipRuntimeState {
-	return { entries: new Map() };
+	return { entries: new Map(), quarantines: new Map(), currentTurn: 0 };
 }
 
 /**

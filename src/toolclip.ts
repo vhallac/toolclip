@@ -22,6 +22,14 @@
  * is at least as large as its original — the observation target for
  * reintroducing a length gate later.
  *
+ * Quarantine: results above the much higher `quarantineThresholdTokens`
+ * (default 10000) are withheld from the LLM entirely — content swapped for
+ * a `[tool-result-quarantined: ...]` notice, payload held for exactly one
+ * turn ("use it or lose it"), retrievable via the registered
+ * `read_quarantined_result` tool. The read's own result re-enters the
+ * normal pending-marker path (it is replaceable), never re-quarantined —
+ * that would be a loop.
+ *
  * The `context` event does the actual swap before each LLM call.
  *
  * The LLM is the only actor. There is no auto-summarizer and no auto-eviction.
@@ -37,6 +45,8 @@ import type {
 	ExtensionContext,
 	AgentToolUpdateCallback,
 	MessageEndEvent,
+	TurnStartEvent,
+	TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
@@ -52,6 +62,14 @@ import {
 	getDivisor,
 } from "../lib/tokens.ts";
 import { buildPendingMarker, buildReplacedMarker } from "../lib/marker.ts";
+import {
+	recordQuarantine,
+	releaseQuarantine,
+	evictExpiredQuarantines,
+	buildQuarantineNotice,
+	buildQuarantineMissedNotice,
+	clearQuarantines,
+} from "../lib/quarantine.ts";
 import {
 	createSteeringState,
 	resetSteering,
@@ -125,6 +143,15 @@ export default function toolclip(api: ExtensionAPI): void {
 
 	// -----------------------------------------------------------------------
 	// 1. tool_result event handler
+	//
+	//    Three outcomes, in order:
+	//    a. replace_tool_result results — skipped (self-replacement loop).
+	//    b. read_quarantined_result results — never re-quarantined (that
+	//       would be a loop); they fall through the normal pending-marker
+	//       path so the freshly-returned payload is replaceable.
+	//    c. everything else — quarantined above the quarantine threshold
+	//       (payload withheld), pending-marked above the pending threshold,
+	//       untouched below it.
 	// -----------------------------------------------------------------------
 	api.on("tool_result", (event: ToolResultEvent) => {
 		// Guard against the self-replacement loop: the result of a
@@ -139,6 +166,37 @@ export default function toolclip(api: ExtensionAPI): void {
 		}
 
 		const tokens = estimateToolResultTokens(event.content, divisor());
+
+		// A read of a quarantined payload re-enters the normal replacement
+		// path: it is large by construction, so it gets a pending marker (if
+		// above the pending threshold) but must NOT be re-quarantined — the
+		// LLM explicitly asked for this content.
+		if (event.toolName === "read_quarantined_result") {
+			if (tokens <= config.toolResultThresholdTokens) {
+				return;
+			}
+			recordPending(state, event.toolCallId, tokens, flattenContent(event.content));
+			return {
+				content: [...event.content, { type: "text" as const, text: buildPendingMarker(event.toolCallId, tokens) }],
+			};
+		}
+
+		// Quarantine gate: above the (much higher) quarantine threshold the
+		// content is withheld entirely — swapped for a notice, payload held for
+		// one turn. No pending entry is recorded: there is nothing in context
+		// to replace.
+		if (
+			config.quarantine &&
+			tokens > config.quarantineThresholdTokens
+		) {
+			recordQuarantine(state, event.toolCallId, flattenContent(event.content), tokens, state.currentTurn);
+			return {
+				content: [
+					{ type: "text" as const, text: buildQuarantineNotice(event.toolCallId, tokens) },
+				],
+			};
+		}
+
 		// Size gate: only results strictly above the configured token threshold
 		// get a pending marker. Smaller results are too cheap to distill —
 		// marking them wastes a toolCallId and steering budget. Empty results
@@ -309,6 +367,62 @@ export default function toolclip(api: ExtensionAPI): void {
 	});
 
 	// -----------------------------------------------------------------------
+	// 2b. read_quarantined_result tool registration
+	//
+	//    Single-turn escape hatch for a quarantined payload. Honored only
+	//    while the payload is held (the turn right after the quarantine); a
+	//    read releases the payload — subsequent reads for the id are denied.
+	//    The description deliberately stresses the cost (full payload back
+	//    into context) and the preferred alternative (narrow the call).
+	// -----------------------------------------------------------------------
+	api.registerTool({
+		name: "read_quarantined_result",
+		label: "Read Quarantined Result",
+		description:
+			"Retrieve the full payload of a tool result that was quarantined as too large. " +
+			"Know the trade-off before you call: the entire payload re-enters your context at full " +
+			"token cost, and you can only do this in the response immediately after the " +
+			"[tool-result-quarantined: ...] notice — the data is freed right after that response, " +
+			"and later calls for the id are denied. Prefer re-issuing a narrower version of the " +
+			"original tool call instead of reading.",
+		promptSnippet:
+			"`read_quarantined_result({ toolCallId })` returns a tool result that was withheld " +
+			"as too large. Call it only in your immediately next response, and only when the full " +
+			"payload is truly needed — the quarantine is freed afterwards and the call is then " +
+			"denied. Prefer narrowing the original tool call instead.",
+		parameters: Type.Object({
+			toolCallId: Type.String({
+				description:
+					"The toolCallId shown in the [tool-result-quarantined: ...] notice.",
+			}),
+		}),
+		async execute(
+			toolCallId: string,
+			params: { toolCallId: string },
+			_signal: AbortSignal | undefined,
+			_onUpdate: AgentToolUpdateCallback<unknown> | undefined,
+			_ctx: ExtensionContext,
+		): Promise<AgentToolResult<unknown>> {
+			const entry = releaseQuarantine(state, params.toolCallId);
+			if (!entry) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: buildQuarantineMissedNotice(params.toolCallId),
+						},
+					],
+					details: { ok: false, reason: "not held (already read, or window expired)" },
+				};
+			}
+			return {
+				content: [{ type: "text" as const, text: entry.payload }],
+				details: { ok: true, toolCallId: params.toolCallId, tokens: entry.tokens },
+			};
+		},
+	});
+
+	// -----------------------------------------------------------------------
 	// 3. before_agent_start — inject marker explanation and tool description
 	//    into the system prompt
 	// -----------------------------------------------------------------------
@@ -316,6 +430,12 @@ export default function toolclip(api: ExtensionAPI): void {
 		// New round: reset the steering latch so the reminder can fire at most
 		// once for this round.
 		resetSteering(steering);
+
+		// Defensive: a held payload never survives a round boundary. Live
+		// quarantines are already evicted by the turn_end that closes their
+		// one-turn window — this covers aborted runs that never reached it.
+		clearQuarantines(state);
+
 
 		const toolclipInstructions =
 			"\n## Tool Result Replacement\n" +
@@ -343,7 +463,20 @@ export default function toolclip(api: ExtensionAPI): void {
 			"- Keep each replacement tight: the point is to free context, so capture only " +
 			"  what you will actually need later.\n" +
 			"- The only valid reason to keep a marked result un-replaced is that you have not " +
-			"  yet read it. Once you have read it, replace it before moving on.\n";
+			"  yet read it. Once you have read it, replace it before moving on.\n" +
+			"\n## Quarantined Tool Results\n" +
+			`A tool result above ${config.quarantineThresholdTokens} tokens is not shown to you at all: ` +
+			"its content is replaced by a [tool-result-quarantined: ...] notice and the full payload is " +
+			"held for exactly one response.\n" +
+			"- First choice: never read it. Re-issue the tool call with a narrower scope (specific " +
+			"  file, tighter pattern, smaller range) so the result comes back small enough to use.\n" +
+			"- Only when the full payload is genuinely required, call " +
+			"  `read_quarantined_result({ toolCallId: \"...\" })` in your immediately next response. That " +
+			"  is the only window: once that response ends, the payload is freed and read attempts for " +
+			"  it are denied.\n" +
+			"- Reading is costly: the whole payload returns to your context at full size. If you do " +
+			"  read it, treat it like any other large result — extract what you need and replace it " +
+			"  promptly via replace_tool_result.\n";
 
 		return {
 			systemPrompt: event.systemPrompt + toolclipInstructions,
@@ -429,5 +562,24 @@ export default function toolclip(api: ExtensionAPI): void {
 			return;
 		}
 		observeTokens(calibrator, snapshotChars, input);
+	});
+
+	// -----------------------------------------------------------------------
+	// 6. turn_start / turn_end — quarantine bookkeeping.
+	//
+	//    pi delivers a turn's tool results at that turn's turn_end, so the
+	//    LLM first sees a quarantine notice when it generates the NEXT turn
+	//    (`createdTurn + 1`). That next turn is the only read window; reads
+	//    execute during it, before its turn_end. Eviction at turn_end with
+	//    `createdTurn <= turnIndex - 1` therefore frees still-unread payloads
+	//    exactly when their one-turn window closes, without ever evicting a
+	//    payload that could not yet have been read.
+	// -----------------------------------------------------------------------
+	api.on("turn_start", (event: TurnStartEvent) => {
+		state.currentTurn = event.turnIndex;
+	});
+
+	api.on("turn_end", (event: TurnEndEvent) => {
+		evictExpiredQuarantines(state, event.turnIndex);
 	});
 }

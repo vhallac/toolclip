@@ -28,6 +28,13 @@ const DEFAULT_CALIBRATE = true;
  */
 const DEFAULT_CALIBRATOR_INITIAL_DIVISOR = 4;
 
+/**
+ * Default minimum token count for a tool result to be quarantined. Well
+ * above the pending-marker threshold: routine large results (1k–10k) just
+ * get pending markers; only truly huge results are held out of context.
+ */
+const DEFAULT_QUARANTINE_THRESHOLD_TOKENS = 10000;
+
 function parseBool(value: string | undefined, fallback: boolean): boolean {
 	if (value === undefined) {
 		return fallback;
@@ -79,6 +86,12 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
  * chars-per-token divisor used by the token estimator starts at
  * `calibratorInitialDivisor` (default 4) and is blended toward the model's
  * real token counts each turn. Disable to pin the divisor at the heuristic.
+ *
+ * Quarantine: results above `quarantineThresholdTokens` (default 10000) are
+ * withheld from the LLM entirely — the content is swapped for a notice and
+ * the payload is held for exactly one turn, retrievable via
+ * `read_quarantined_result` ("use it or lose it"). Disable to fall back to
+ * plain pending markers for all sizes.
  */
 export function loadToolclipConfig(env: NodeJS.ProcessEnv = process.env): ToolclipConfig {
 	return {
@@ -95,6 +108,11 @@ export function loadToolclipConfig(env: NodeJS.ProcessEnv = process.env): Toolcl
 		calibratorInitialDivisor: parsePositiveNum(
 			env.TOOLCLIP_CALIBRATOR_INITIAL_DIVISOR,
 			DEFAULT_CALIBRATOR_INITIAL_DIVISOR,
+		),
+		quarantine: parseBool(env.TOOLCLIP_QUARANTINE, true),
+		quarantineThresholdTokens: parsePositiveInt(
+			env.TOOLCLIP_QUARANTINE_THRESHOLD_TOKENS,
+			DEFAULT_QUARANTINE_THRESHOLD_TOKENS,
 		),
 	};
 }

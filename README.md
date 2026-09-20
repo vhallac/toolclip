@@ -24,6 +24,11 @@ The LLM is the only actor. There is no auto-summarizer and no auto-eviction. The
    The marker stays for traceability. Cache breaks here — by design.
 4. If the LLM never calls the tool, the original result stays in place. No automatic eviction.
 5. **Steering reminder.** If the agent leaves marked results un-replaced for several turns, toolclip injects a single trailing `user` message reminding it to call `replace_tool_result`. This fires **at most once per round**. It is cache-safe: it is appended to the *end* of the context as a new user block (pi's standard steering path), so the cached prefix — original prompt and all prior messages — is never touched; only the tail re-prepills.
+6. **Quarantine.** Results above a much higher threshold (default 10000 tokens) are withheld from the LLM entirely: the content is swapped for a notice
+   ```
+   [tool-result-quarantined: toolCallId=abc, tokens=12000]
+   ```
+   and the payload is held aside for exactly one turn — use it or lose it. The agent first sees the notice in the turn after the quarantine (pi delivers a turn's tool results at that turn's end, so it cannot react within the same turn); a `read_quarantined_result({ toolCallId })` call issued in that next turn is honored — even as one of several tool calls in the batch. At the turn_end that closes the window, unread payloads are freed and later read attempts are denied with a `[quarantine-missed: ...]` notice. The read's own result re-enters the normal pending-marker path (it is replaceable), and is never re-quarantined. Held payloads never survive a round boundary.
 
 ## Configuration
 
@@ -34,6 +39,8 @@ The LLM is the only actor. There is no auto-summarizer and no auto-eviction. The
 | `TOOLCLIP_STEERING_REMINDER_TURN` | `3` | Minimum tool-result-bearing turns while a pending marker exists before the reminder is eligible. |
 | `TOOLCLIP_CALIBRATE` | `true` | Calibrate the token-estimator divisor against the model's real token counts each turn (ephemeral, per session). |
 | `TOOLCLIP_CALIBRATOR_INITIAL_DIVISOR` | `4` | Starting chars-per-token divisor (and the fixed divisor when calibration is disabled). |
+| `TOOLCLIP_QUARANTINE` | `true` | Withhold results above the quarantine threshold (payload held for one turn, retrievable via `read_quarantined_result`). Disable to fall back to plain pending markers for all sizes. |
+| `TOOLCLIP_QUARANTINE_THRESHOLD_TOKENS` | `10000` | Minimum estimated token count for a tool result to be quarantined. Well above the pending threshold: routine large results (1k–10k) just get pending markers. |
 
 The max-replacement-ratio gate is intentionally **not** reintroduced: `replace_tool_result` accepts a replacement of any size and records a `grew` flag when a replacement is at least as large as its original — the observation target for reintroducing a length gate later.
 
