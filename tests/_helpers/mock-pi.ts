@@ -28,14 +28,6 @@ export function createMockApi(): MockApi {
 		registerTool(tool: ToolReg) {
 			tools.set(tool.name, tool);
 		},
-		// Tool inventory surface used by the calibrator's overhead accounting;
-		// tests override these on `pi` when they need specific tools.
-		getActiveTools(): string[] {
-			return [];
-		},
-		getAllTools(): Array<{ name: string; description?: string; parameters?: unknown }> {
-			return [];
-		},
 	};
 	return { handlers, tools, pi };
 }

@@ -16,19 +16,6 @@ const DEFAULT_TOOL_RESULT_THRESHOLD_TOKENS = 1000;
 const DEFAULT_STEERING_REMINDER_TURN = 3;
 
 /**
- * Default for whether the token-estimator divisor is calibrated against the
- * model's real token counts each turn. Calibration is ephemeral (per
- * session) and improves the accuracy of the pending-marker token counts.
- */
-const DEFAULT_CALIBRATE = true;
-
-/**
- * Default starting chars-per-token divisor when calibration is enabled.
- * Chars/4 is the same heuristic sesclip uses.
- */
-const DEFAULT_CALIBRATOR_INITIAL_DIVISOR = 4;
-
-/**
  * Default minimum token count for a tool result to be quarantined. Well
  * above the pending-marker threshold: routine large results (1k–10k) just
  * get pending markers; only truly huge results are held out of context.
@@ -40,17 +27,6 @@ function parseBool(value: string | undefined, fallback: boolean): boolean {
 		return fallback;
 	}
 	return value === "1" || value.toLowerCase() === "true";
-}
-
-function parsePositiveNum(value: string | undefined, fallback: number): number {
-	if (value === undefined) {
-		return fallback;
-	}
-	const n = Number(value);
-	if (!Number.isFinite(n) || n <= 0) {
-		return fallback;
-	}
-	return n;
 }
 
 function parsePositiveInt(value: string | undefined, fallback: number): number {
@@ -82,11 +58,6 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
  * turns. It is cache-safe — it is appended to the *end* of the context (a
  * new user block), so the cached prefix is never touched.
  *
- * Divisor calibration is ephemeral and per-session: when enabled, the
- * chars-per-token divisor used by the token estimator starts at
- * `calibratorInitialDivisor` (default 4) and is blended toward the model's
- * real token counts each turn. Disable to pin the divisor at the heuristic.
- *
  * Quarantine: results above `quarantineThresholdTokens` (default 10000) are
  * withheld from the LLM entirely — the content is swapped for a notice and
  * the payload is held for exactly one turn, retrievable via
@@ -103,11 +74,6 @@ export function loadToolclipConfig(env: NodeJS.ProcessEnv = process.env): Toolcl
 		steeringReminderTurn: parsePositiveInt(
 			env.TOOLCLIP_STEERING_REMINDER_TURN,
 			DEFAULT_STEERING_REMINDER_TURN,
-		),
-		calibrate: parseBool(env.TOOLCLIP_CALIBRATE, DEFAULT_CALIBRATE),
-		calibratorInitialDivisor: parsePositiveNum(
-			env.TOOLCLIP_CALIBRATOR_INITIAL_DIVISOR,
-			DEFAULT_CALIBRATOR_INITIAL_DIVISOR,
 		),
 		quarantine: parseBool(env.TOOLCLIP_QUARANTINE, true),
 		quarantineThresholdTokens: parsePositiveInt(

@@ -7,8 +7,6 @@ describe("loadToolclipConfig", () => {
 			toolResultThresholdTokens: 1000,
 			steeringReminder: true,
 			steeringReminderTurn: 3,
-			calibrate: true,
-			calibratorInitialDivisor: 4,
 			quarantine: true,
 			quarantineThresholdTokens: 10000,
 		});
@@ -76,33 +74,8 @@ describe("loadToolclipConfig", () => {
 			toolResultThresholdTokens: 1000,
 			steeringReminder: true,
 			steeringReminderTurn: 3,
-			calibrate: true,
-			calibratorInitialDivisor: 4,
 			quarantine: true,
 			quarantineThresholdTokens: 10000,
 		});
-	});
-
-	it("disables calibration via TOOLCLIP_CALIBRATE=false", () => {
-		const config = loadToolclipConfig({
-			TOOLCLIP_CALIBRATE: "false",
-		} as NodeJS.ProcessEnv);
-		expect(config.calibrate).toBe(false);
-	});
-
-	it("overrides the initial divisor via TOOLCLIP_CALIBRATOR_INITIAL_DIVISOR", () => {
-		const config = loadToolclipConfig({
-			TOOLCLIP_CALIBRATOR_INITIAL_DIVISOR: "3",
-		} as NodeJS.ProcessEnv);
-		expect(config.calibratorInitialDivisor).toBe(3);
-	});
-
-	it("falls back to default initial divisor for non-positive or non-numeric values", () => {
-		for (const bad of ["0", "-1", "abc", ""]) {
-			const config = loadToolclipConfig({
-				TOOLCLIP_CALIBRATOR_INITIAL_DIVISOR: bad,
-			} as NodeJS.ProcessEnv);
-			expect(config.calibratorInitialDivisor).toBe(4);
-		}
 	});
 });

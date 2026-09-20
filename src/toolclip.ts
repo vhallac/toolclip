@@ -44,7 +44,6 @@ import type {
 	AgentToolResult,
 	ExtensionContext,
 	AgentToolUpdateCallback,
-	MessageEndEvent,
 	TurnStartEvent,
 	TurnEndEvent,
 } from "@earendil-works/pi-coding-agent";
@@ -52,16 +51,7 @@ import { Type } from "@sinclair/typebox";
 
 import { loadToolclipConfig } from "../lib/toolclip-config.ts";
 import { createRuntimeState } from "../lib/runtime-state.ts";
-import {
-	estimateTokens,
-	estimateMessagesTokens,
-	countMessagesChars,
-	createCalibrator,
-	setSnapshotChars,
-	setOverheadChars,
-	observeTokens,
-	getDivisor,
-} from "../lib/tokens.ts";
+import { estimateTokens } from "../lib/tokens.ts";
 import { buildPendingMarker, buildReplacedMarker } from "../lib/marker.ts";
 import {
 	recordQuarantine,
@@ -94,14 +84,11 @@ import type { ToolclipRuntimeState } from "../lib/types.ts";
  * to the token estimate. Image blocks contribute their description text
  * (if any) plus a fixed overhead representing the base64 data.
  */
-function estimateToolResultTokens(
-	content: ToolResultEvent["content"],
-	divisor: number,
-): number {
+function estimateToolResultTokens(content: ToolResultEvent["content"]): number {
 	let total = 0;
 	for (const block of content) {
 		if (block.type === "text") {
-			total += estimateTokens(block.text, divisor);
+			total += estimateTokens(block.text);
 		}
 	}
 	return total;
@@ -134,13 +121,6 @@ export default function toolclip(api: ExtensionAPI): void {
 	const config = loadToolclipConfig();
 	const state: ToolclipRuntimeState = createRuntimeState();
 	const steering = createSteeringState();
-	const calibrator = createCalibrator(config.calibratorInitialDivisor);
-
-	// Read the current calibrated divisor. When calibration is disabled the
-	// divisor is fixed at the configured initial value.
-	function divisor(): number {
-		return config.calibrate ? getDivisor(calibrator) : config.calibratorInitialDivisor;
-	}
 
 	// -----------------------------------------------------------------------
 	// 1. tool_result event handler
@@ -166,7 +146,7 @@ export default function toolclip(api: ExtensionAPI): void {
 			return;
 		}
 
-		const tokens = estimateToolResultTokens(event.content, divisor());
+		const tokens = estimateToolResultTokens(event.content);
 
 		// A read of a quarantined payload re-enters the normal replacement
 		// path: it is large by construction, so it gets a pending marker (if
@@ -251,7 +231,7 @@ export default function toolclip(api: ExtensionAPI): void {
 				reason: "unknown id",
 			};
 		}
-		const replacementTokens = estimateTokens(pair.replacement, divisor());
+		const replacementTokens = estimateTokens(pair.replacement);
 		// No size gate: accept any replacement. Record a `grew` flag when the
 		// replacement is at least as large as the original — the observation
 		// target. If we see `grew: true` in real runs, that is the signal to
@@ -477,33 +457,6 @@ export default function toolclip(api: ExtensionAPI): void {
 			"  read it, treat it like any other large result — extract what you need and replace it " +
 			"  promptly via replace_tool_result.\n";
 
-		// Calibration scope: the denominator (total prompt tokens) covers the
-		// system prompt and the serialized tool definitions, which are absent
-		// from the messages array the `context` handler snapshots. Record their
-		// character counts as the calibrator's overhead so both sides of the
-		// ratio cover the same scope. event.systemPrompt is the fully assembled
-		// prompt for this round BEFORE our appended instructions.
-		let toolDefChars = 0;
-		if (typeof api.getAllTools === "function" && typeof api.getActiveTools === "function") {
-			const active = new Set(api.getActiveTools());
-			for (const tool of api.getAllTools()) {
-				if (!active.has(tool.name)) {
-					continue;
-				}
-				toolDefChars += JSON.stringify({
-					name: tool.name,
-					description: tool.description,
-					parameters: tool.parameters,
-				}).length;
-			}
-		}
-		setOverheadChars(
-			calibrator,
-			(typeof event.systemPrompt === "string" ? event.systemPrompt.length : 0) +
-				toolclipInstructions.length +
-				toolDefChars,
-		);
-
 		return {
 			systemPrompt: event.systemPrompt + toolclipInstructions,
 		} satisfies BeforeAgentStartEventResult;
@@ -519,16 +472,6 @@ export default function toolclip(api: ExtensionAPI): void {
 	//    (original prompt + all prior messages) is never modified.
 	// -----------------------------------------------------------------------
 	api.on("context", (event: ContextEvent) => {
-		// Calibration: snapshot the character count of the (unmodified)
-		// message array. This corresponds to the prompt that the immediately
-		// following LLM call will see; `message_end` pairs it with the model's
-		// actual `usage.input` for that call. We count the ORIGINAL messages,
-		// not the `modified` array, so the snapshot is the true pre-swap input
-		// pi sends. (The swap and steering append happen after this snapshot.)
-		if (config.calibrate) {
-			setSnapshotChars(calibrator, countMessagesChars(event.messages));
-		}
-
 		const modified = event.messages.map((msg) => {
 			if (msg.role !== "toolResult") {
 				return msg;
@@ -567,45 +510,7 @@ export default function toolclip(api: ExtensionAPI): void {
 	});
 
 	// -----------------------------------------------------------------------
-	// 5. message_end event handler — calibrate the token-estimator divisor.
-	//
-	//    Each assistant message carries the model's usage for the prompt that
-	//    produced it. We already snapped that prompt's character count in the
-	//    preceding `context` handler, so here we blend the observed
-	//    chars-per-token ratio into the running divisor (EMA).
-	//
-	//    Scope fix: providers report `usage.input` as ONLY the non-cached
-	//    portion of the prompt (pi-ai normalizes OpenAI-completions usage as
-	//    `input = prompt_tokens − cached − cache_write`); cached tokens ride
-	//    in `usage.cacheRead` / `usage.cacheWrite`. Pairing snapshotChars
-	//    (the whole history) with `input` alone made the observed ratio
-	//    explode as the cache grew — the divisor ratcheted from 4 to ~35 in
-	//    the golden-sample session. The denominator is therefore the TOTAL
-	//    prompt tokens: input + cacheRead + cacheWrite.
-	//
-	//    Only assistant messages have `usage`; user/toolResult messages are
-	//    ignored. Degenerate samples (zero/non-finite chars or tokens) are
-	//    skipped by `observeTokens`; the blended result is clamped to [2, 8].
-	// -----------------------------------------------------------------------
-	api.on("message_end", (event: MessageEndEvent) => {
-		const usage = (
-			event.message as { usage?: { input?: unknown; cacheRead?: unknown; cacheWrite?: unknown } }
-		).usage;
-		if (!usage || typeof usage.input !== "number" || config.calibrate === false) {
-			return;
-		}
-		const input = usage.input;
-		const cacheRead = typeof usage.cacheRead === "number" ? usage.cacheRead : 0;
-		const cacheWrite = typeof usage.cacheWrite === "number" ? usage.cacheWrite : 0;
-		const snapshotChars = calibrator.latestChars;
-		if (snapshotChars === null) {
-			return;
-		}
-		observeTokens(calibrator, snapshotChars, input + cacheRead + cacheWrite);
-	});
-
-	// -----------------------------------------------------------------------
-	// 6. turn_start / turn_end — quarantine bookkeeping.
+	// 5. turn_start / turn_end — quarantine bookkeeping.
 	//
 	//    pi delivers a turn's tool results at that turn's turn_end, so the
 	//    LLM first sees a quarantine notice when it generates the NEXT turn

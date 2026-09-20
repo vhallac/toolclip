@@ -15,12 +15,12 @@ import { describe, expect, it, vi, afterEach } from "vitest";
 import toolclip from "../src/toolclip.ts";
 import { createMockApi, invokeHandler, invokeTool } from "./_helpers/mock-pi.ts";
 
-// 40004 chars / 4 = 10001 tokens — strictly above the 10000 quarantine threshold.
-const QUAR_TEXT = "x".repeat(40004);
-// 39996 chars / 4 = 9999 tokens — below quarantine, above the 1000 pending threshold.
-const PEND_TEXT = "y".repeat(39996);
-// 40000 chars / 4 = 10000 tokens — exactly at the quarantine threshold (not above).
-const BOUNDARY_TEXT = "z".repeat(40000);
+// tokenx: 14286 tokens — strictly above the 10000 quarantine threshold.
+const QUAR_TEXT = "x".repeat(100000);
+// tokenx: 6000 tokens — below quarantine, above the 1000 pending threshold.
+const PEND_TEXT = "y".repeat(42000);
+// tokenx: 10000 tokens — exactly at the quarantine threshold (not above).
+const BOUNDARY_TEXT = "z".repeat(70000);
 
 function toolResultEvent(toolCallId: string, text: string, toolName = "bash") {
 	return {
@@ -48,7 +48,7 @@ describe("toolclip quarantine — tool_result handling", () => {
 
 		expect(result.content).toHaveLength(1); // content swapped, not marker-appended
 		const notice = result.content[0].text;
-		expect(notice).toContain("[tool-result-quarantined: toolCallId=bash-1, tokens=10001]");
+		expect(notice).toContain("[tool-result-quarantined: toolCallId=bash-1, tokens=14286]");
 		expect(notice).toContain("read_quarantined_result");
 		expect(notice).not.toContain(QUAR_TEXT);
 	});
@@ -65,7 +65,7 @@ describe("toolclip quarantine — tool_result handling", () => {
 		expect(result.content).toHaveLength(2);
 		expect(result.content[0].text).toBe(PEND_TEXT); // original intact
 		expect(result.content[1].text).toBe(
-			"[tool-result-pending-replacement: toolCallId=bash-1, tokens=9999]",
+			"[tool-result-pending-replacement: toolCallId=bash-1, tokens=6000]",
 		);
 	});
 
@@ -96,7 +96,7 @@ describe("toolclip quarantine — the one-turn read window", () => {
 			toolCallId: "bash-1",
 		})) as { content: Array<{ type: string; text: string }>; details: Record<string, unknown> };
 
-		expect(read.details).toMatchObject({ ok: true, toolCallId: "bash-1", tokens: 10001 });
+		expect(read.details).toMatchObject({ ok: true, toolCallId: "bash-1", tokens: 14286 });
 		expect(read.content[0].text).toBe(QUAR_TEXT); // full payload returned
 
 		// pi fires tool_result for the read itself: the payload is marked
@@ -109,7 +109,7 @@ describe("toolclip quarantine — the one-turn read window", () => {
 		expect(readResult.content).toHaveLength(2);
 		expect(readResult.content[0].text).toBe(QUAR_TEXT);
 		expect(readResult.content[1].text).toBe(
-			"[tool-result-pending-replacement: toolCallId=read-1, tokens=10001]",
+			"[tool-result-pending-replacement: toolCallId=read-1, tokens=14286]",
 		);
 
 		// The read result is replaceable via the normal mechanism.

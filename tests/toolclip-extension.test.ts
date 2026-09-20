@@ -11,8 +11,8 @@ describe("tool_result handler", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 
-		// 4004 chars / 4 = ceil(1001) = 1001 tokens — just above the 1000 default.
-		const longText = "x".repeat(4004);
+		// tokenx: 1286 tokens — just above the 1000 default.
+		const longText = "x".repeat(9000);
 		const result = invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "read-1",
@@ -29,7 +29,7 @@ describe("tool_result handler", () => {
 		expect(content[0].text).toBe(longText);
 		expect(content[1].type).toBe("text");
 		expect(content[1].text).toMatch(
-			/^\[tool-result-pending-replacement: toolCallId=read-1, tokens=1001\]$/,
+			/^\[tool-result-pending-replacement: toolCallId=read-1, tokens=1286\]$/,
 		);
 	});
 
@@ -37,7 +37,7 @@ describe("tool_result handler", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 
-		// 500 chars / 4 = 125 tokens — well below the 1000 default. Small
+		// tokenx: 72 tokens — well below the 1000 default. Small
 		// results are too cheap to distill; marking them wastes budget.
 		const shortText = "x".repeat(500);
 		const result = invokeHandler(handlers, "tool_result", {
@@ -58,8 +58,8 @@ describe("tool_result handler", () => {
 		try {
 			toolclip(pi as never);
 
-			// 500/4 = 125 tokens > 100 threshold → marked.
-			const shortText = "x".repeat(500);
+			// tokenx: 143 tokens > 100 threshold → marked.
+			const shortText = "x".repeat(1000);
 			const result = invokeHandler(handlers, "tool_result", {
 				type: "tool_result",
 				toolCallId: "read-low",
@@ -71,7 +71,7 @@ describe("tool_result handler", () => {
 			expect(result).toBeDefined();
 			const content = (result as { content: Array<{ type: string; text: string }> }).content;
 			expect(content).toHaveLength(2);
-			expect(content[1].text).toContain("tokens=125");
+			expect(content[1].text).toContain("tokens=143");
 		} finally {
 			if (prev === undefined) {
 				delete process.env.TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS;
@@ -100,9 +100,9 @@ describe("tool_result handler", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 
-		const block1 = "x".repeat(2000);  // 500 tokens
-		const block2 = "y".repeat(2004);  // 501 tokens
-		// Total: 1001 tokens — above the 1000 default.
+		const block1 = "x".repeat(6000);  // tokenx: 858 tokens
+		const block2 = "y".repeat(6004);  // tokenx: 858 tokens
+		// Total: 1716 tokens — above the 1000 default.
 		const result = invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "multi-1",
@@ -117,7 +117,7 @@ describe("tool_result handler", () => {
 		expect(result).toBeDefined();
 		const content = (result as { content: Array<{ type: string; text: string }> }).content;
 		expect(content).toHaveLength(3);
-		expect(content[2].text).toContain("tokens=1001");
+		expect(content[2].text).toContain("tokens=1716");
 	});
 
 	it("does not append a marker when the only text is short but present (image blocks ignored)", () => {
@@ -135,7 +135,7 @@ describe("tool_result handler", () => {
 			isError: false,
 		});
 
-		// 17 chars / 4 = ceil(4.25) = 5 tokens — non-zero but below the 1000
+		// tokenx: 3 tokens — non-zero but below the 1000
 		// threshold, so no marker. Image blocks never contribute to the estimate.
 		expect(result).toBeUndefined();
 	});
@@ -204,12 +204,12 @@ describe("replace_tool_result tool", () => {
 		const { handlers, pi, tools } = createMockApi();
 		toolclip(pi as never);
 
-		// Emit a tool result to create a pending entry (4004 chars = 1001 tokens, above threshold)
+		// Emit a tool result to create a pending entry (tokenx: 1286 tokens, above threshold)
 		invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "tool-1",
 			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(4004) }],
+			content: [{ type: "text", text: "x".repeat(9000) }],
 			isError: false,
 		});
 
@@ -220,8 +220,8 @@ describe("replace_tool_result tool", () => {
 		expect(result.details).toMatchObject({ ok: true });
 		const r0 = (result.details.results as Array<Record<string, unknown>>)[0];
 		expect(r0).toMatchObject({ toolCallId: "tool-1", ok: true });
-		expect(r0.originalTokens).toBe(1001);
-		expect(r0.replacementTokens).toBe(4);
+		expect(r0.originalTokens).toBe(1286);
+		expect(r0.replacementTokens).toBe(2); // tokenx("short summary")
 		expect(r0.grew).toBe(false);
 	});
 
@@ -235,7 +235,7 @@ describe("replace_tool_result tool", () => {
 			type: "tool_result",
 			toolCallId: "tool-bare",
 			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(4004) }],
+			content: [{ type: "text", text: "x".repeat(9000) }],
 			isError: false,
 		});
 
@@ -256,24 +256,24 @@ describe("replace_tool_result tool", () => {
 		const { handlers, pi, tools } = createMockApi();
 		toolclip(pi as never);
 
-		// 5200 chars / 4 = 1300 tokens (above threshold)
+		// tokenx: 1143 tokens (above threshold)
 		invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "tool-grew",
 			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(5200) }],
+			content: [{ type: "text", text: "x".repeat(8000) }],
 			isError: false,
 		});
 
-		// 5600 chars / 4 = 1400 tokens > 1300 original — previously hard-failed.
+		// tokenx: 1200 tokens > 1143 original — previously hard-failed.
 		const result = (await invokeTool(tools, "replace_tool_result", "tool-grew", {
-			items: [{ toolCallId: "tool-grew", replacement: "x".repeat(5600) }],
+			items: [{ toolCallId: "tool-grew", replacement: "x".repeat(8400) }],
 		})) as { details: Record<string, unknown> };
 
 		const r0 = (result.details.results as Array<Record<string, unknown>>)[0];
 		expect(r0).toMatchObject({ ok: true });
-		expect(r0.originalTokens).toBe(1300);
-		expect(r0.replacementTokens).toBe(1400);
+		expect(r0.originalTokens).toBe(1143);
+		expect(r0.replacementTokens).toBe(1200);
 		expect(r0.grew).toBe(true);
 	});
 
@@ -289,7 +289,7 @@ describe("replace_tool_result tool", () => {
 			isError: false,
 		});
 
-		// 500 chars / 4 = 125 tokens vs 2000 original → ratio 0.0625, previously
+		// tokenx: 72 tokens vs 1143 original → ratio 0.063, previously
 		// rejected by the 0.1 soft-fail ceiling. Now accepted.
 		const result = (await invokeTool(tools, "replace_tool_result", "tool-soft", {
 			items: [{ toolCallId: "tool-soft", replacement: "y".repeat(500) }],
@@ -321,7 +321,7 @@ describe("replace_tool_result tool", () => {
 			type: "tool_result",
 			toolCallId: "tool-idem",
 			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(4004) }],
+			content: [{ type: "text", text: "x".repeat(9000) }],
 			isError: false,
 		});
 
@@ -336,7 +336,7 @@ describe("replace_tool_result tool", () => {
 		})) as { details: Record<string, unknown> };
 		const r2 = (res2.details.results as Array<Record<string, unknown>>)[0];
 		expect(r2.ok).toBe(true);
-		expect(r2.replacementTokens).toBe(1);
+		expect(r2.replacementTokens).toBe(1); // tokenx("v2")
 	});
 
 	it("handles zero-length replacement (0 tokens)", async () => {
@@ -347,7 +347,7 @@ describe("replace_tool_result tool", () => {
 			type: "tool_result",
 			toolCallId: "tool-zero",
 			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(4004) }],
+			content: [{ type: "text", text: "x".repeat(9000) }],
 			isError: false,
 		});
 
@@ -368,7 +368,7 @@ describe("replace_tool_result tool", () => {
 			type: "tool_result",
 			toolCallId: "batch-a",
 			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(4004) }],
+			content: [{ type: "text", text: "x".repeat(9000) }],
 			isError: false,
 		});
 		invokeHandler(handlers, "tool_result", {
@@ -421,12 +421,12 @@ describe("context event handler", () => {
 		const { handlers, pi, tools } = createMockApi();
 		toolclip(pi as never);
 
-		// Emit a long tool result and replace it (4004 chars = 1001 tokens, above threshold)
+		// Emit a long tool result and replace it (tokenx: 1286 tokens, above threshold)
 		invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "replaced-1",
 			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(4004) }],
+			content: [{ type: "text", text: "x".repeat(9000) }],
 			isError: false,
 		});
 
@@ -532,7 +532,7 @@ describe("context event handler", () => {
 // steering reminder tests (context handler)
 // -----------------------------------------------------------------------
 describe("steering reminder injection", () => {
-	const LONG = "x".repeat(4004); // 1001 tokens — above the 1000 threshold
+	const LONG = "x".repeat(9000); // 1286 tokens — above the 1000 threshold
 
 	// Helper: emit a tool_result to create a pending (un-replaced) entry.
 	function emitPending(handlers: Map<string, Handler[]>, toolCallId: string): void {
@@ -782,182 +782,5 @@ describe("before_agent_start handler", () => {
 
 		const result = invokeHandler(handlers, "before_agent_start", event);
 		expect(result).toBeUndefined();
-	});
-});
-// -----------------------------------------------------------------------
-// calibration (context snapshot + message_end) tests
-// -----------------------------------------------------------------------
-describe("divisor calibration", () => {
-	it("recalibrates the divisor from message_end usage and changes later markers", () => {
-		const { handlers, pi } = createMockApi();
-		toolclip(pi as never);
-
-		// 1. A `context` event with 4000 chars of message content snapshots
-		//    the character count for the prompt pi is about to send.
-		const contextEvent = {
-			type: "context",
-			messages: [
-				{ role: "user", content: [{ type: "text", text: "y".repeat(4000) }] },
-			],
-		};
-		invokeHandler(handlers, "context", contextEvent);
-
-		// 2. The model reports 2000 actual input tokens for that prompt → the
-		//    true chars-per-token is 2, not the default 4. First sample has
-		//    alpha = 1, so the divisor jumps to 2.
-		invokeHandler(handlers, "message_end", {
-			type: "message_end",
-			message: { role: "assistant", usage: { input: 2000 } },
-		});
-
-		// 3. A fresh tool result of 4000 chars is now estimated with the
-		//    calibrated divisor 2 → ceil(4000/2) = 2000 tokens in its marker,
-		//    not the 1000 the default divisor would have produced.
-		const result = invokeHandler(handlers, "tool_result", {
-			type: "tool_result",
-			toolCallId: "bash-cal",
-			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(4000) }],
-			isError: false,
-		});
-
-		expect(result).toBeDefined();
-		const content = (result as { content: Array<{ type: string; text: string }> }).content;
-		expect(content[1].text).toMatch(
-			/^\[tool-result-pending-replacement: toolCallId=bash-cal, tokens=2000\]$/,
-		);
-	});
-
-	it("does not calibrate when TOOLCLIP_CALIBRATE=false (marker stays at default divisor)", () => {
-		const { handlers, pi } = createMockApi();
-		const prev = process.env.TOOLCLIP_CALIBRATE;
-		process.env.TOOLCLIP_CALIBRATE = "false";
-		try {
-			toolclip(pi as never);
-
-			// Snapshot + message_end would normally move the divisor.
-			invokeHandler(handlers, "context", {
-				type: "context",
-				messages: [{ role: "user", content: "y".repeat(4000) }],
-			});
-			invokeHandler(handlers, "message_end", {
-				type: "message_end",
-				message: { role: "assistant", usage: { input: 2000 } },
-			});
-
-			// 4010 chars still estimated with divisor 4 → 1003 tokens (and above
-			// the 1000 threshold, so a marker is emitted). Without calibration the
-			// divisor stays pinned at the default.
-			const result = invokeHandler(handlers, "tool_result", {
-				type: "tool_result",
-				toolCallId: "bash-cal2",
-				toolName: "bash",
-				content: [{ type: "text", text: "x".repeat(4010) }],
-				isError: false,
-			});
-			const content = (result as { content: Array<{ type: string; text: string }> }).content;
-			expect(content[1].text).toMatch(
-				/^\[tool-result-pending-replacement: toolCallId=bash-cal2, tokens=1003\]$/,
-			);
-		} finally {
-			if (prev === undefined) {
-				delete process.env.TOOLCLIP_CALIBRATE;
-			} else {
-				process.env.TOOLCLIP_CALIBRATE = prev;
-			}
-		}
-	});
-});
-
-// -----------------------------------------------------------------------
-// calibration scope + clamp (golden-sample regression) tests
-// -----------------------------------------------------------------------
-describe("divisor calibration scope and clamp", () => {
-	it("uses input + cacheRead + cacheWrite as the denominator", () => {
-		const { handlers, pi } = createMockApi();
-		toolclip(pi as never);
-
-		// 4000 message chars snapshotted for the prompt.
-		invokeHandler(handlers, "context", {
-			type: "context",
-			messages: [{ role: "user", content: [{ type: "text", text: "y".repeat(4000) }] }],
-		});
-
-		// The provider reports input=500 with 1400 cached-read and 100
-		// cache-write tokens. input alone would give an observed divisor of 8
-		// (4000/500); the TOTAL prompt is 2000 tokens → true divisor 2.
-		invokeHandler(handlers, "message_end", {
-			type: "message_end",
-			message: {
-				role: "assistant",
-				usage: { input: 500, cacheRead: 1400, cacheWrite: 100 },
-			},
-		});
-
-		// Marker must use divisor 2 → ceil(4000/2) = 2000 tokens.
-		const result = invokeHandler(handlers, "tool_result", {
-			type: "tool_result",
-			toolCallId: "bash-cache",
-			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(4000) }],
-			isError: false,
-		});
-		const content = (result as { content: Array<{ type: string; text: string }> }).content;
-		expect(content[1].text).toMatch(
-			/^\[tool-result-pending-replacement: toolCallId=bash-cache, tokens=2000\]$/,
-		);
-	});
-
-	it("counts the system prompt + tool defs in the numerator, and clamps at MAX", () => {
-		const { handlers, pi } = createMockApi();
-		// A huge system prompt (and a tool schema); the inactive tool must be
-		// excluded from the overhead.
-		pi.getActiveTools = () => ["read"];
-		pi.getAllTools = () => [
-			{
-				name: "read",
-				description: "d".repeat(500),
-				parameters: { type: "object" },
-			},
-			{
-				name: "inactive-tool",
-				description: "z".repeat(100000),
-				parameters: {},
-			},
-		] as never;
-		toolclip(pi as never);
-
-		// Round starts with a 100k-char system prompt → overhead ≥ 100k.
-		invokeHandler(handlers, "before_agent_start", {
-			type: "before_agent_start",
-			systemPrompt: "S".repeat(100000),
-		});
-
-		// 4000 message chars against 1000 total tokens → observed ≥ 104
-		// without overhead accounting; with overhead included the observed
-		// ratio is far above 8, so the clamp must hold the divisor at MAX.
-		invokeHandler(handlers, "context", {
-			type: "context",
-			messages: [{ role: "user", content: [{ type: "text", text: "y".repeat(4000) }] }],
-		});
-		invokeHandler(handlers, "message_end", {
-			type: "message_end",
-			message: { role: "assistant", usage: { input: 1000 } },
-		});
-
-		// Divisor 8 → ceil(9000/8) = 1125 tokens (a divisor-4 estimate would
-		// have produced 2250, and without overhead accounting divisor 4 would
-		// apply to 4000 chars → 1000 → no marker at all).
-		const result = invokeHandler(handlers, "tool_result", {
-			type: "tool_result",
-			toolCallId: "bash-overhead",
-			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(9000) }],
-			isError: false,
-		});
-		const content = (result as { content: Array<{ type: string; text: string }> }).content;
-		expect(content[1].text).toMatch(
-			/^\[tool-result-pending-replacement: toolCallId=bash-overhead, tokens=1125\]$/,
-		);
 	});
 });

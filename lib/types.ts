@@ -36,19 +36,6 @@ export interface ToolclipConfig {
 	 */
 	steeringReminderTurn: number;
 	/**
-	 * Whether the token-estimator divisor is calibrated against the model's
-	 * real token counts (`usage.input`) each turn. Calibration is ephemeral
-	 * (per-session) and improves the accuracy of the pending-marker token
-	 * counts. Defaults to `true`. Gated by `TOOLCLIP_CALIBRATE`.
-	 */
-	calibrate: boolean;
-	/**
-	 * Starting chars-per-token divisor when calibration is enabled (and the
-	 * divisor when it is disabled). Defaults to `4`, matching the chars/4
-	 * heuristic. Gated by `TOOLCLIP_CALIBRATOR_INITIAL_DIVISOR`.
-	 */
-	calibratorInitialDivisor: number;
-	/**
 	 * Whether oversized tool results are quarantined (content swapped for a
 	 * notice, payload held for one turn). Defaults to `true`. Gated by
 	 * `TOOLCLIP_QUARANTINE`.

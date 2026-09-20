@@ -37,14 +37,12 @@ The LLM is the only actor. There is no auto-summarizer and no auto-eviction. The
 | `TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS` | `1000` | Minimum estimated token count for a tool result to get a pending marker. Results at or below the threshold are left untouched. |
 | `TOOLCLIP_STEERING_REMINDER` | `true` | Inject a single trailing steering reminder per round when marked results stay un-replaced for several turns. |
 | `TOOLCLIP_STEERING_REMINDER_TURN` | `3` | Minimum tool-result-bearing turns while a pending marker exists before the reminder is eligible. |
-| `TOOLCLIP_CALIBRATE` | `true` | Calibrate the token-estimator divisor against the model's real token counts each turn (ephemeral, per session). |
-| `TOOLCLIP_CALIBRATOR_INITIAL_DIVISOR` | `4` | Starting chars-per-token divisor (and the fixed divisor when calibration is disabled). |
 | `TOOLCLIP_QUARANTINE` | `true` | Withhold results above the quarantine threshold (payload held for one turn, retrievable via `read_quarantined_result`). Disable to fall back to plain pending markers for all sizes. |
 | `TOOLCLIP_QUARANTINE_THRESHOLD_TOKENS` | `10000` | Minimum estimated token count for a tool result to be quarantined. Well above the pending threshold: routine large results (1k–10k) just get pending markers. |
 
 The max-replacement-ratio gate is intentionally **not** reintroduced: `replace_tool_result` accepts a replacement of any size and records a `grew` flag when a replacement is at least as large as its original — the observation target for reintroducing a length gate later.
 
-**Token estimation & calibration.** Token counts use the chars/N heuristic (`Math.ceil(length / divisor)`), starting at chars/4 (same as sesclip). When calibration is enabled, the divisor is tuned to the active model over the session: each turn, the character count of the prompt (messages plus the constant system prompt + tool definitions) is compared against the model's TOTAL prompt tokens (`usage.input + usage.cacheRead + usage.cacheWrite` — `usage.input` alone excludes cached tokens), and the observed chars-per-token ratio is blended into the divisor via an exponential moving average. The blended divisor is clamped to [2, 8] so a scope-mismatched or degenerate sample cannot poison estimates; if calibration keeps pinning at a boundary, the sample pairing itself is wrong (the cue to switch to delta calibration). Calibration is ephemeral — it does not persist across sessions (persistence is a deferred improvement). Exactly the same divisor drives the pending-marker token counts and the replacement estimates, so markers stay consistent with what the model actually spends.
+**Token estimation.** Token counts come from [`tokenx`](https://github.com/johannschopplich/tokenx) — a zero-dependency, 2kB heuristic estimator calibrated against OpenAI's `o200k_base` tokenizer (~95% average accuracy; measured on real glm sessions it tracks reported prompt tokens within ~6% mean error for tool-result-sized content, where the previous chars/4 heuristic was off by ~10%). The same estimator drives the pending-marker counts, both thresholds, and the replacement size reports. There is deliberately **no runtime calibration**: an earlier attempt learned a chars/token divisor from `usage` each turn, and it could not converge — the pairing between "what we counted" and "what the provider reported" cannot cover the real prompt composition (tool-call arguments, per-message serialization overhead, provider cache quantization), so the divisor drifted with session shape (to ~35 before a scope fix, then to ~3.4 after it). A static, consistent estimate plus threshold margins is the simpler and more predictable shape.
 
 ## Why this is separate from sesclip
 
@@ -53,7 +51,7 @@ Sesclip compacts the **entire** session context when it crosses a threshold. Too
 ## Out of scope (deferred)
 
 - Retrieval tools (`get_tool_result`, `grep_tool_result`, pagination).
-- Real tokenizer dependency (chars/N is good enough; the divisor is calibrated to the active model instead).
+- Full tokenizer dependency (a vocab-carrying tokenizer like `gpt-tokenizer` is not worth its bundle size here — tokenx's heuristic is accurate enough for gating decisions).
 - Auto-summarization at `tool_result` time (would lose fidelity — the LLM must see the original first).
 - Size gates on replacements (removed for observation; reintroduce once we see `grew: true` in real runs).
 
