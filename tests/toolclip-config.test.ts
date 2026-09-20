@@ -2,8 +2,9 @@ import { describe, expect, it } from "vitest";
 import { loadToolclipConfig } from "../lib/toolclip-config.ts";
 
 describe("loadToolclipConfig", () => {
-	it("returns the steering reminder enabled by default with turn threshold 3", () => {
+	it("returns the tool result threshold of 1000 by default", () => {
 		expect(loadToolclipConfig({} as NodeJS.ProcessEnv)).toEqual({
+			toolResultThresholdTokens: 1000,
 			steeringReminder: true,
 			steeringReminderTurn: 3,
 		});
@@ -43,15 +44,32 @@ describe("loadToolclipConfig", () => {
 		}
 	});
 
-	it("ignores legacy size-threshold env vars", () => {
-		// Size thresholds were removed so replacement behavior can be observed
-		// without pre-filtering or gating. Legacy env vars are ignored.
+	it("overrides the tool result threshold via TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS", () => {
 		const config = loadToolclipConfig({
-			TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS: "500",
+			TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS: "250",
+		} as NodeJS.ProcessEnv);
+
+		expect(config.toolResultThresholdTokens).toBe(250);
+	});
+
+	it("falls back to default tool result threshold for non-positive or non-integer values", () => {
+		for (const bad of ["0", "-1", "2.5", "abc", ""]) {
+			const config = loadToolclipConfig({
+				TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS: bad,
+			} as NodeJS.ProcessEnv);
+			expect(config.toolResultThresholdTokens).toBe(1000);
+		}
+	});
+
+	it("ignores the legacy max-replacement-ratio env var (gate stays removed)", () => {
+		// The max-replacement-ratio gate was removed for observation and stays
+		// removed; its env var is not surfaced in config.
+		const config = loadToolclipConfig({
 			TOOLCLIP_MAX_REPLACEMENT_RATIO: "0.25",
 		} as NodeJS.ProcessEnv);
 
 		expect(config).toEqual({
+			toolResultThresholdTokens: 1000,
 			steeringReminder: true,
 			steeringReminderTurn: 3,
 		});

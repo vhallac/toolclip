@@ -1,13 +1,22 @@
 /**
  * Toolclip configuration.
  *
- * Currently empty: size-bound thresholds (the marker token threshold and the
- * max-replacement-ratio) were removed so replacement behavior can be observed
- * without pre-filtering or gating. Kept as an interface (rather than deleted)
- * so config plumbing stays in place for when we reintroduce limits based on
- * observed behavior.
+ * `toolResultThresholdTokens`: minimum estimated token count for a tool
+ * result to get a pending-replacement marker. Results at or below this
+ * threshold are left untouched — they are too small for distillation to pay
+ * off, so marking them only wastes a toolCallId and steering budget. The
+ * max-replacement-ratio gate is intentionally NOT reintroduced:
+ * replacements of any size are accepted (the hard-fail "replacement must be
+ * strictly shorter than original" check was removed for observation and
+ * stays removed).
  */
 export interface ToolclipConfig {
+	/**
+	 * Minimum estimated token count for a tool result to receive a pending
+	 * marker. Results with fewer tokens are skipped entirely. Defaults to
+	 * `1000`. Gated by `TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS`.
+	 */
+	toolResultThresholdTokens: number;
 	/**
 	 * Whether to inject a single steering reminder per round when the agent
 	 * has left marked tool results un-replaced for several turns. Defaults

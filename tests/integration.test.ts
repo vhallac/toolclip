@@ -15,7 +15,7 @@ import { describe, expect, it } from "vitest";
 import toolclip from "../src/toolclip.ts";
 import { createMockApi, invokeHandler, invokeTool } from "./_helpers/mock-pi.ts";
 
-const LONG_TEXT = "x".repeat(2000); // 500 tokens
+const LONG_TEXT = "x".repeat(4004); // 4004/4 = ceil(1001) = 1001 tokens — above the 1000 threshold
 
 describe("toolclip — smoke integration", () => {
 	it("drives the full flow: marker → replace → swap on next context", async () => {
@@ -34,7 +34,7 @@ describe("toolclip — smoke integration", () => {
 
 		expect(toolResult.content).toHaveLength(2);
 		expect(toolResult.content[1].text).toBe(
-			"[tool-result-pending-replacement: toolCallId=bash-1, tokens=500]",
+			"[tool-result-pending-replacement: toolCallId=bash-1, tokens=1001]",
 		);
 
 		// 2. Next `context` event includes the tool result message WITH the
@@ -66,7 +66,7 @@ describe("toolclip — smoke integration", () => {
 
 		expect(replaceResult.details).toMatchObject({ ok: true });
 		const rr = (replaceResult.details.results as Array<Record<string, unknown>>)[0];
-		expect(rr.originalTokens).toBe(500);
+		expect(rr.originalTokens).toBe(1001);
 		expect(rr.replacementTokens).toBe(4);
 
 		// 4. Next `context` event shows the swap (cache-break point).
@@ -102,11 +102,11 @@ describe("toolclip — smoke integration", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 
-		// A tool result with no replacement recorded stays in place. (With the
-		// threshold removed, even a short result gets a marker at tool_result
-		// time — but this test fires `context` directly without first emitting
-		// a tool_result event, so no pending entry exists and the message is
-		// untouched.)
+		// A tool result with no replacement recorded stays in place. This test
+		// fires `context` directly without first emitting a tool_result event,
+		// so no pending entry exists and the message is untouched. (A short
+		// result would also be untouched at tool_result time, since it is below
+		// the 1000-token threshold.)
 		const event = {
 			type: "context",
 			messages: [
@@ -204,7 +204,8 @@ describe("toolclip — smoke integration", () => {
 			items: [{ toolCallId: "replaced-1", replacement: "tight summary" }],
 		});
 
-		// 3. Short result → pending entry (threshold removed) but NOT replaced.
+		// 3. Short result → BELOW threshold, so no pending marker and no entry.
+		//    It stays untouched in the context event (no swap).
 		const shortResult = invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "short-1",
@@ -212,6 +213,9 @@ describe("toolclip — smoke integration", () => {
 			content: [{ type: "text", text: "ok" }],
 			isError: false,
 		}) as { content: Array<{ type: string; text: string }> };
+
+		// Confirm the short result got no marker at tool_result time.
+		expect(shortResult).toBeUndefined();
 
 		// All three appear in the next context event.
 		const event = {
@@ -235,7 +239,7 @@ describe("toolclip — smoke integration", () => {
 					role: "toolResult",
 					toolCallId: "short-1",
 					toolName: "bash",
-					content: shortResult.content,
+					content: [{ type: "text", text: "ok" }],
 					isError: false,
 				},
 			],
@@ -255,8 +259,9 @@ describe("toolclip — smoke integration", () => {
 			"[tool-result-replaced: toolCallId=replaced-1]",
 		);
 
-		// Short → pending but not replaced, so marker stays (no swap).
-		expect(result.messages[2].content).toHaveLength(2);
-		expect(result.messages[2].content[1].text).toContain("tool-result-pending-replacement");
+		// Short → below threshold, never marked, so it stays as the single
+		// original text block (no swap, no marker).
+		expect(result.messages[2].content).toHaveLength(1);
+		expect(result.messages[2].content[0].text).toBe("ok");
 	});
 });

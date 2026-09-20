@@ -7,12 +7,12 @@ import type { Handler } from "./_helpers/mock-pi.ts";
 // tool_result event handler tests
 // -----------------------------------------------------------------------
 describe("tool_result handler", () => {
-	it("appends a pending marker to every non-empty text result", () => {
+	it("appends a pending marker to a result above the token threshold", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 
-		// No size threshold: any non-empty text result gets a marker.
-		const longText = "x".repeat(1001); // 1001/4 = ceil(250.25) = 251 tokens
+		// 4004 chars / 4 = ceil(1001) = 1001 tokens — just above the 1000 default.
+		const longText = "x".repeat(4004);
 		const result = invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "read-1",
@@ -29,15 +29,17 @@ describe("tool_result handler", () => {
 		expect(content[0].text).toBe(longText);
 		expect(content[1].type).toBe("text");
 		expect(content[1].text).toMatch(
-			/^\[tool-result-pending-replacement: toolCallId=read-1, tokens=251\]$/,
+			/^\[tool-result-pending-replacement: toolCallId=read-1, tokens=1001\]$/,
 		);
 	});
 
-	it("appends a marker even to a short result (no threshold)", () => {
+	it("does NOT append a marker to a result at or below the token threshold", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 
-		const shortText = "x".repeat(500); // 500/4 = 125 tokens
+		// 500 chars / 4 = 125 tokens — well below the 1000 default. Small
+		// results are too cheap to distill; marking them wastes budget.
+		const shortText = "x".repeat(500);
 		const result = invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "read-2",
@@ -46,13 +48,40 @@ describe("tool_result handler", () => {
 			isError: false,
 		});
 
-		expect(result).toBeDefined();
-		const content = (result as { content: Array<{ type: string; text: string }> }).content;
-		expect(content).toHaveLength(2);
-		expect(content[1].text).toContain("tokens=125");
+		expect(result).toBeUndefined();
 	});
 
-	it("does NOT append a marker for an empty result (0 tokens)", () => {
+	it("appends a marker to a short result when the threshold is lowered via env", () => {
+		const { handlers, pi } = createMockApi();
+		const prev = process.env.TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS;
+		process.env.TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS = "100";
+		try {
+			toolclip(pi as never);
+
+			// 500/4 = 125 tokens > 100 threshold → marked.
+			const shortText = "x".repeat(500);
+			const result = invokeHandler(handlers, "tool_result", {
+				type: "tool_result",
+				toolCallId: "read-low",
+				toolName: "read",
+				content: [{ type: "text", text: shortText }],
+				isError: false,
+			});
+
+			expect(result).toBeDefined();
+			const content = (result as { content: Array<{ type: string; text: string }> }).content;
+			expect(content).toHaveLength(2);
+			expect(content[1].text).toContain("tokens=125");
+		} finally {
+			if (prev === undefined) {
+				delete process.env.TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS;
+			} else {
+				process.env.TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS = prev;
+			}
+		}
+	});
+
+	it("does NOT append a marker for an empty result (0 tokens, below threshold)", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 
@@ -71,9 +100,9 @@ describe("tool_result handler", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 
-		const block1 = "x".repeat(600);  // 150 tokens
-		const block2 = "y".repeat(604);  // 151 tokens
-		// Total: 301 tokens
+		const block1 = "x".repeat(2000);  // 500 tokens
+		const block2 = "y".repeat(2004);  // 501 tokens
+		// Total: 1001 tokens — above the 1000 default.
 		const result = invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "multi-1",
@@ -88,10 +117,10 @@ describe("tool_result handler", () => {
 		expect(result).toBeDefined();
 		const content = (result as { content: Array<{ type: string; text: string }> }).content;
 		expect(content).toHaveLength(3);
-		expect(content[2].text).toContain("tokens=301");
+		expect(content[2].text).toContain("tokens=1001");
 	});
 
-	it("appends a marker when the only text is short but present (image blocks ignored)", () => {
+	it("does not append a marker when the only text is short but present (image blocks ignored)", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 
@@ -106,10 +135,9 @@ describe("tool_result handler", () => {
 			isError: false,
 		});
 
-		// 17 chars / 4 = ceil(4.25) = 5 tokens — non-zero, so marker is appended.
-		expect(result).toBeDefined();
-		const content = (result as { content: Array<{ type: string; text: string }> }).content;
-		expect(content[2].text).toContain("tokens=5");
+		// 17 chars / 4 = ceil(4.25) = 5 tokens — non-zero but below the 1000
+		// threshold, so no marker. Image blocks never contribute to the estimate.
+		expect(result).toBeUndefined();
 	});
 
 	it("does not append a marker when content has only an image and no text", () => {
@@ -132,7 +160,7 @@ describe("tool_result handler", () => {
 		const { handlers, pi } = createMockApi();
 		toolclip(pi as never);
 
-		const originalContent = [{ type: "text" as const, text: "x".repeat(2500) }];
+		const originalContent = [{ type: "text" as const, text: "x".repeat(4004) }];
 		const event = {
 			type: "tool_result",
 			toolCallId: "mutate-1",
@@ -144,7 +172,7 @@ describe("tool_result handler", () => {
 		invokeHandler(handlers, "tool_result", event);
 
 		expect(originalContent).toHaveLength(1);
-		expect(originalContent[0].text).toBe("x".repeat(2500));
+		expect(originalContent[0].text).toBe("x".repeat(4004));
 	});
 
 	it("does NOT append a marker to the result of replace_tool_result itself (self-replacement guard)", () => {
@@ -176,12 +204,12 @@ describe("replace_tool_result tool", () => {
 		const { handlers, pi, tools } = createMockApi();
 		toolclip(pi as never);
 
-		// Emit a tool result to create a pending entry
+		// Emit a tool result to create a pending entry (4004 chars = 1001 tokens, above threshold)
 		invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "tool-1",
 			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(2000) }],
+			content: [{ type: "text", text: "x".repeat(4004) }],
 			isError: false,
 		});
 
@@ -192,7 +220,7 @@ describe("replace_tool_result tool", () => {
 		expect(result.details).toMatchObject({ ok: true });
 		const r0 = (result.details.results as Array<Record<string, unknown>>)[0];
 		expect(r0).toMatchObject({ toolCallId: "tool-1", ok: true });
-		expect(r0.originalTokens).toBe(500);
+		expect(r0.originalTokens).toBe(1001);
 		expect(r0.replacementTokens).toBe(4);
 		expect(r0.grew).toBe(false);
 	});
@@ -207,7 +235,7 @@ describe("replace_tool_result tool", () => {
 			type: "tool_result",
 			toolCallId: "tool-bare",
 			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(2000) }],
+			content: [{ type: "text", text: "x".repeat(4004) }],
 			isError: false,
 		});
 
@@ -228,24 +256,24 @@ describe("replace_tool_result tool", () => {
 		const { handlers, pi, tools } = createMockApi();
 		toolclip(pi as never);
 
-		// 1200 chars / 4 = 300 tokens
+		// 5200 chars / 4 = 1300 tokens (above threshold)
 		invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "tool-grew",
 			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(1200) }],
+			content: [{ type: "text", text: "x".repeat(5200) }],
 			isError: false,
 		});
 
-		// 1300 chars / 4 = 325 tokens > 300 original — previously hard-failed.
+		// 5600 chars / 4 = 1400 tokens > 1300 original — previously hard-failed.
 		const result = (await invokeTool(tools, "replace_tool_result", "tool-grew", {
-			items: [{ toolCallId: "tool-grew", replacement: "x".repeat(1300) }],
+			items: [{ toolCallId: "tool-grew", replacement: "x".repeat(5600) }],
 		})) as { details: Record<string, unknown> };
 
 		const r0 = (result.details.results as Array<Record<string, unknown>>)[0];
 		expect(r0).toMatchObject({ ok: true });
-		expect(r0.originalTokens).toBe(300);
-		expect(r0.replacementTokens).toBe(325);
+		expect(r0.originalTokens).toBe(1300);
+		expect(r0.replacementTokens).toBe(1400);
 		expect(r0.grew).toBe(true);
 	});
 
@@ -257,11 +285,11 @@ describe("replace_tool_result tool", () => {
 			type: "tool_result",
 			toolCallId: "tool-soft",
 			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(4000) }],
+			content: [{ type: "text", text: "x".repeat(8000) }],
 			isError: false,
 		});
 
-		// 500 chars / 4 = 125 tokens vs 1000 original → ratio 0.125, previously
+		// 500 chars / 4 = 125 tokens vs 2000 original → ratio 0.0625, previously
 		// rejected by the 0.1 soft-fail ceiling. Now accepted.
 		const result = (await invokeTool(tools, "replace_tool_result", "tool-soft", {
 			items: [{ toolCallId: "tool-soft", replacement: "y".repeat(500) }],
@@ -293,7 +321,7 @@ describe("replace_tool_result tool", () => {
 			type: "tool_result",
 			toolCallId: "tool-idem",
 			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(2000) }],
+			content: [{ type: "text", text: "x".repeat(4004) }],
 			isError: false,
 		});
 
@@ -319,7 +347,7 @@ describe("replace_tool_result tool", () => {
 			type: "tool_result",
 			toolCallId: "tool-zero",
 			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(2000) }],
+			content: [{ type: "text", text: "x".repeat(4004) }],
 			isError: false,
 		});
 
@@ -340,14 +368,14 @@ describe("replace_tool_result tool", () => {
 			type: "tool_result",
 			toolCallId: "batch-a",
 			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(2000) }],
+			content: [{ type: "text", text: "x".repeat(4004) }],
 			isError: false,
 		});
 		invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "batch-b",
 			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(4000) }],
+			content: [{ type: "text", text: "x".repeat(8000) }],
 			isError: false,
 		});
 
@@ -393,12 +421,12 @@ describe("context event handler", () => {
 		const { handlers, pi, tools } = createMockApi();
 		toolclip(pi as never);
 
-		// Emit a long tool result and replace it
+		// Emit a long tool result and replace it (4004 chars = 1001 tokens, above threshold)
 		invokeHandler(handlers, "tool_result", {
 			type: "tool_result",
 			toolCallId: "replaced-1",
 			toolName: "bash",
-			content: [{ type: "text", text: "x".repeat(2000) }],
+			content: [{ type: "text", text: "x".repeat(4004) }],
 			isError: false,
 		});
 
@@ -504,7 +532,7 @@ describe("context event handler", () => {
 // steering reminder tests (context handler)
 // -----------------------------------------------------------------------
 describe("steering reminder injection", () => {
-	const LONG = "x".repeat(2000); // 500 tokens
+	const LONG = "x".repeat(4004); // 1001 tokens — above the 1000 threshold
 
 	// Helper: emit a tool_result to create a pending (un-replaced) entry.
 	function emitPending(handlers: Map<string, Handler[]>, toolCallId: string): void {

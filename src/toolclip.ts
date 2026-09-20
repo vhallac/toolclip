@@ -14,11 +14,13 @@
  * self-replacement loop where the LLM dutifully re-replaces its own
  * replacement results — burning tokens for no gain.
  *
- * Size-bound thresholds (marker threshold + max-replacement-ratio) have been
- * removed so replacement behavior can be observed without pre-filtering or
- * gating. Replacements of any size are accepted; the tool records a `grew`
- * flag when a replacement is at least as large as its original — the
- * observation target for reintroducing limits later.
+ * Size gate: only tool results strictly above `toolResultThresholdTokens`
+ * (default 1000) get a pending marker — distillation does not pay off for
+ * small results, so marking them only wastes a toolCallId and steering
+ * budget. The max-replacement-ratio gate stays removed: replacements of any
+ * size are accepted, and the tool records a `grew` flag when a replacement
+ * is at least as large as its original — the observation target for
+ * reintroducing a length gate later.
  *
  * The `context` event does the actual swap before each LLM call.
  *
@@ -118,10 +120,11 @@ export default function toolclip(api: ExtensionAPI): void {
 		}
 
 		const tokens = estimateToolResultTokens(event.content);
-		// No size threshold: every non-empty text result gets a marker so we
-		// can observe replacement behavior broadly. Empty results are skipped
-		// — there is nothing to distill.
-		if (tokens <= 0) {
+		// Size gate: only results strictly above the configured token threshold
+		// get a pending marker. Smaller results are too cheap to distill —
+		// marking them wastes a toolCallId and steering budget. Empty results
+		// are skipped here too (0 tokens is never above the threshold).
+		if (tokens <= config.toolResultThresholdTokens) {
 			return;
 		}
 

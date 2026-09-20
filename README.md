@@ -1,6 +1,6 @@
 # toolclip
 
-A pi coding agent extension that shrinks long tool results without losing them. When a tool returns a result over the configured token threshold, toolclip appends a marker the LLM can act on. The LLM may then call `replace_tool_result(id, replacement)` to swap that bulky result for a tight replacement in subsequent turns.
+A pi coding agent extension that shrinks long tool results without losing them. When a tool returns a result above the configured token threshold (default 1000), toolclip appends a marker the LLM can act on. The LLM may then call `replace_tool_result(id, replacement)` to swap that bulky result for a tight replacement in subsequent turns.
 
 The LLM is the only actor. There is no auto-summarizer and no auto-eviction. The cache break that happens when a result is replaced is known and accepted — the bet is that a 15-line replacement wins over the duration of a long session against a 10K tool result.
 
@@ -14,7 +14,7 @@ The LLM is the only actor. There is no auto-summarizer and no auto-eviction. The
    ```
    [tool-result-pending-replacement: toolCallId=abc, tokens=1024]
    ```
-   The original content is **not** modified. (Size thresholds were removed so replacement behavior can be observed without pre-filtering — every non-empty result is marked.)
+   The original content is **not** modified. Only results strictly above the token threshold (default 1000) are marked — smaller results are too cheap to distill.
 2. The LLM can call `replace_tool_result(toolCallId, replacement)` at its leisure. **No length gate is applied** — replacements of any size are accepted. The tool records a `grew` flag (`replacementTokens >= originalTokens`) in its details so observers can detect replacements that bloat rather than shrink context. That flag is the signal for reintroducing a length gate later.
 3. On the `context` event (before each LLM call), any `ToolResultMessage` whose `toolCallId` has a stored replacement is swapped to:
    ```
@@ -27,7 +27,13 @@ The LLM is the only actor. There is no auto-summarizer and no auto-eviction. The
 
 ## Configuration
 
-No size-bound configuration is applied at present. Size thresholds (the marker token threshold and the max-replacement-ratio) were removed so replacement behavior can be observed without pre-filtering or gating — the bet being that we should confirm replacements actually bloat context before band-aiding a healthy finger. The config plumbing (`loadToolclipConfig`) and the `ToolclipConfig` interface remain in place so limits can be reintroduced once observation warrants.
+| Env var | Default | Meaning |
+|---|---|---|
+| `TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS` | `1000` | Minimum estimated token count for a tool result to get a pending marker. Results at or below the threshold are left untouched. |
+| `TOOLCLIP_STEERING_REMINDER` | `true` | Inject a single trailing steering reminder per round when marked results stay un-replaced for several turns. |
+| `TOOLCLIP_STEERING_REMINDER_TURN` | `3` | Minimum tool-result-bearing turns while a pending marker exists before the reminder is eligible. |
+
+The max-replacement-ratio gate is intentionally **not** reintroduced: `replace_tool_result` accepts a replacement of any size and records a `grew` flag when a replacement is at least as large as its original — the observation target for reintroducing a length gate later. Token estimation uses `Math.ceil(text.length / 4)` (chars/4 heuristic, same as sesclip).
 
 The steering reminder is configurable:
 

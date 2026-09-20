@@ -1,6 +1,13 @@
 import type { ToolclipConfig } from "./types.ts";
 
 /**
+ * Default minimum token count for a tool result to get a pending marker.
+ * Results at or below this threshold are too small for distillation to pay
+ * off — marking them only wastes a toolCallId and steering budget.
+ */
+const DEFAULT_TOOL_RESULT_THRESHOLD_TOKENS = 1000;
+
+/**
  * Default turn threshold for the steering reminder. The reminder fires at
  * most once per round, and only once the agent has made at least this many
  * tool-result-bearing turns while a pending-unreplaced marker exists — i.e.
@@ -29,24 +36,27 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
 /**
  * Load toolclip configuration.
  *
- * Size-bound thresholds (marker threshold + max-replacement-ratio) have been
- * removed so we can observe replacement behavior without pre-filtering or
- * gating. Every non-empty text tool result gets a pending marker, and
- * `replace_tool_result` accepts a replacement of any size. The extension
- * records when a replacement grew larger than its original (the observation
- * target); no rejection happens.
+ * The marker token threshold (`toolResultThresholdTokens`, default 1000)
+ * gates which tool results get a pending-replacement marker: only results
+ * strictly above the threshold are marked. Smaller results are skipped —
+ * distillation does not pay off for them.
  *
- * If/when we observe replacements that bloat rather than shrink context,
- * that is the signal to reintroduce a gate here.
+ * The max-replacement-ratio gate is intentionally NOT reintroduced.
+ * `replace_tool_result` accepts a replacement of any size and records when
+ * a replacement grew larger than its original (the observation target); no
+ * rejection happens.
  *
- * The one config knob that remains is the steering reminder: a single
- * trailing user message injected once per round when the agent has left
- * marked results un-replaced for several turns. It is cache-safe — it is
- * appended to the *end* of the context (a new user block), so the cached
- * prefix is never touched.
+ * The steering reminder is a single trailing user message injected once per
+ * round when the agent has left marked results un-replaced for several
+ * turns. It is cache-safe — it is appended to the *end* of the context (a
+ * new user block), so the cached prefix is never touched.
  */
 export function loadToolclipConfig(env: NodeJS.ProcessEnv = process.env): ToolclipConfig {
 	return {
+		toolResultThresholdTokens: parsePositiveInt(
+			env.TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS,
+			DEFAULT_TOOL_RESULT_THRESHOLD_TOKENS,
+		),
 		steeringReminder: parseBool(env.TOOLCLIP_STEERING_REMINDER, true),
 		steeringReminderTurn: parsePositiveInt(
 			env.TOOLCLIP_STEERING_REMINDER_TURN,
