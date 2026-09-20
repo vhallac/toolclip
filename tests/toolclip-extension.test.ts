@@ -392,15 +392,23 @@ describe("before_agent_start handler", () => {
 			systemPrompt: string;
 		};
 
-		expect(result.systemPrompt).toBe(
-			"You are a helpful assistant." +
-				"\n## Tool Result Replacement\n" +
-				"When a long tool result has a [tool-result-pending-replacement: ...] marker, you may call `replace_tool_result(toolCallId, replacement)` to swap the bulky original for a tight summary in subsequent turns.\n" +
-				"- Replace with only what you will need later: key numbers, error codes, paths, decisions, or state summaries.\n" +
-				"- Drop verbose output like file contents, full directory listings, or exhaustive search results once you have extracted the relevant parts.\n" +
-				"- If you don't call the tool, the original result stays untouched. Either option is fine.\n" +
-				"- The replacement must be strictly shorter than the original and within the configured ratio.\n",
+		// Original prompt is preserved verbatim.
+		expect(result.systemPrompt.startsWith("You are a helpful assistant.")).toBe(true);
+		// Key directives of the sharpened prompt are present.
+		expect(result.systemPrompt).toContain("## Tool Result Replacement");
+		expect(result.systemPrompt).toContain(
+			"you MUST call `replace_tool_result(toolCallId, replacement)` as soon as you",
 		);
+		expect(result.systemPrompt).toContain(
+			"from ONE tool result, replace it with the distilled result",
+		);
+		expect(result.systemPrompt).toContain(
+			"large results are the priority",
+		);
+		expect(result.systemPrompt).toContain(
+			"The replacement must be strictly shorter than the original",
+		);
+		expect(result.systemPrompt).toContain("replace it before moving on");
 	});
 
 	it("appends to an empty system prompt", () => {
@@ -421,7 +429,9 @@ describe("before_agent_start handler", () => {
 
 		expect(result.systemPrompt).toContain("## Tool Result Replacement");
 		expect(result.systemPrompt).toContain("replace_tool_result");
-		expect(result.systemPrompt).toContain("Either option is fine");
+		expect(result.systemPrompt).toContain(
+			"you MUST call `replace_tool_result(toolCallId, replacement)` as soon as you",
+		);
 	});
 
 	it("keeps the original prompt when no handler is registered", () => {

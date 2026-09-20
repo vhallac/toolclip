@@ -116,13 +116,15 @@ export default function toolclip(api: ExtensionAPI): void {
 			"Replace a long tool result with a tight summary. " +
 			"The replacement must be strictly shorter than the original and " +
 			"within the configured replacement ratio. " +
-			"Call this for any tool result that has a " +
-			"[tool-result-pending-replacement: ...] marker if you no longer " +
-			"need the full original in later turns.",
+			"You SHOULD call this for every [tool-result-pending-replacement: ...] marker " +
+			"as soon as you have extracted the relevant information. " +
+			"Do not defer replacement —the earlier you replace, the more context you save.",
 		promptSnippet:
-			"You may call `replace_tool_result(toolCallId, replacement)` to " +
-			"swap a long tool result for a tight summary in subsequent turns. " +
-			"The original stays until you do. Either option is fine.",
+			"IMPORTANT: Call `replace_tool_result(toolCallId, replacement)` for every " +
+			"[tool-result-pending-replacement: ...] marker you see. " +
+			"Extract the key information from the tool result, then replace it. " +
+			"Large tool results consume context tokens that could be used for reasoning. " +
+			"Replace them as soon as you can derive the relevant information from a single result.",
 		parameters: Type.Object({
 			toolCallId: Type.String({
 				description: "The toolCallId from the [tool-result-pending-replacement: ...] marker.",
@@ -198,15 +200,30 @@ export default function toolclip(api: ExtensionAPI): void {
 	api.on("before_agent_start", (event: BeforeAgentStartEvent) => {
 		const toolclipInstructions =
 			"\n## Tool Result Replacement\n" +
-			"When a long tool result has a [tool-result-pending-replacement: ...] marker, you may call `replace_tool_result(toolCallId, replacement)` to swap the bulky original for a tight summary in subsequent turns.\n" +
-			"- Replace with only what you will need later: key numbers, error codes, paths, decisions, or state summaries.\n" +
-			"- Drop verbose output like file contents, full directory listings, or exhaustive search results once you have extracted the relevant parts.\n" +
-			"- If you don't call the tool, the original result stays untouched. Either option is fine.\n" +
-			"- The replacement must be strictly shorter than the original and within the configured ratio.\n";
+			"When a long tool result has a [tool-result-pending-replacement: ...] marker, " +
+			"you MUST call `replace_tool_result(toolCallId, replacement)` as soon as you " +
+			"have derived the relevant information from that single tool call.\n" +
+			"- Respond to every marker: as soon as you can extract the information you need " +
+			"  from ONE tool result, replace it with the distilled result. The larger the " +
+			"  original, the more context you save — so large results are the priority, not " +
+			"  a reason to defer.\n" +
+			"- Replace with only what you will need later: key numbers, error codes, paths, " +
+			"  decisions, or state summaries. Keep your replacement tight and complete enough " +
+			"  to answer future questions that depend on this result.\n" +
+			"- Drop verbose output such as file contents, full directory listings, or exhaustive " +
+			"  search results once you have extracted the relevant parts.\n" +
+			"- Do NOT defer replacement hoping to use the full original later. Unless you are " +
+			"  about to reference a specific obscure detail in the very next turn, replace it now.\n" +
+			"- The replacement must be strictly shorter than the original and within the " +
+			"  configured ratio.\n" +
+			"- If you genuinely cannot yet read the full result, or it contains a critical detail " +
+			"  you need in the immediate next step, you may keep it for one more turn — but " +
+			"  replace it before moving on.\n";
 
 		return {
 			systemPrompt: event.systemPrompt + toolclipInstructions,
 		} satisfies BeforeAgentStartEventResult;
+
 	});
 
 	// -----------------------------------------------------------------------
