@@ -32,6 +32,14 @@
  * the model to read the held payload in full when it needs all of it —
  * never to reconstruct it piecemeal with several narrowed calls.
  *
+ * Re-read observation: successful `read` results are counted per path
+ * within the round; when a path is read more than once (the
+ * distill-refetch loop — replacements are irreversible, so re-deriving a
+ * dropped detail means a fresh full-price read), the result's `details`
+ * carry a `toolclipReread` entry, same spirit as the `grew` flag. Purely
+ * diagnostic: LLM-facing content and cache behavior are untouched, and
+ * re-reads that are not consecutive are still flagged (per-round count).
+ *
  * The `context` event does the actual swap before each LLM call.
  *
  * The LLM is the only actor. There is no auto-summarizer and no auto-eviction.
@@ -77,6 +85,12 @@ import {
 	recordReplacement,
 	getReplacement,
 } from "../lib/runtime-state.ts";
+import {
+	observeRead,
+	buildRereadDetails,
+	resetRereads,
+} from "../lib/rereads.ts";
+import type { RereadDetails } from "../lib/rereads.ts";
 import type { ToolclipRuntimeState } from "../lib/types.ts";
 
 /**
@@ -119,6 +133,28 @@ function flattenContent(content: ToolResultEvent["content"]): string {
 	return parts.join("\n");
 }
 
+/**
+ * Merge the re-read observation payload into a tool result's details.
+ *
+ * The runner REPLACES (does not merge) a handler-returned `details`, so the
+ * tool's own details (e.g. the read tool's truncation info) must be carried
+ * through. Returns `undefined` when there is nothing to attach — the caller
+ * then leaves the result's details untouched.
+ */
+function withRereadDetails(
+	base: unknown,
+	reread: RereadDetails | undefined,
+): Record<string, unknown> | undefined {
+	if (reread === undefined) {
+		return undefined;
+	}
+	const baseObj =
+		base !== null && typeof base === "object"
+			? (base as Record<string, unknown>)
+			: {};
+	return { ...baseObj, ...reread };
+}
+
 export default function toolclip(api: ExtensionAPI): void {
 	const config = loadToolclipConfig();
 	const state: ToolclipRuntimeState = createRuntimeState();
@@ -127,7 +163,7 @@ export default function toolclip(api: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 	// 1. tool_result event handler
 	//
-	//    Three outcomes, in order:
+	//    Four outcomes, in order:
 	//    a. replace_tool_result results — skipped (self-replacement loop).
 	//    b. read_quarantined_result results — never re-quarantined (that
 	//       would be a loop); they fall through the normal pending-marker
@@ -135,6 +171,9 @@ export default function toolclip(api: ExtensionAPI): void {
 	//    c. everything else — quarantined above the quarantine threshold
 	//       (payload withheld), pending-marked above the pending threshold,
 	//       untouched below it.
+	//    Every successful `read` is additionally counted per path for the
+	//    re-read observation; from the second read of a path in a round, a
+	//    `toolclipReread` entry is merged into the result's details.
 	// -----------------------------------------------------------------------
 	api.on("tool_result", (event: ToolResultEvent) => {
 		// Guard against the self-replacement loop: the result of a
@@ -147,6 +186,21 @@ export default function toolclip(api: ExtensionAPI): void {
 		if (event.toolName === "replace_tool_result") {
 			return;
 		}
+
+		// Re-read observation hook: count successful reads per path within the
+		// round. Failed reads (isError) are not counted — the diagnostic target
+		// is the distill-refetch loop, which re-fetches successfully. `input`
+		// is optional-chained defensively: the pi contract always carries it,
+		// but a malformed event must not take the handler down.
+		let reread: RereadDetails | undefined;
+		if (event.toolName === "read" && !event.isError) {
+			const path = (event.input as { path?: unknown } | undefined)?.path;
+			if (typeof path === "string" && path.length > 0) {
+				const count = observeRead(state.readsThisRound, path);
+				reread = buildRereadDetails(path, count);
+			}
+		}
+		const details = withRereadDetails(event.details, reread);
 
 		const tokens = estimateToolResultTokens(event.content);
 
@@ -177,6 +231,7 @@ export default function toolclip(api: ExtensionAPI): void {
 				content: [
 					{ type: "text" as const, text: buildQuarantineNotice(event.toolCallId, tokens) },
 				],
+				...(details ? { details } : {}),
 			};
 		}
 
@@ -185,7 +240,10 @@ export default function toolclip(api: ExtensionAPI): void {
 		// marking them wastes a toolCallId and steering budget. Empty results
 		// are skipped here too (0 tokens is never above the threshold).
 		if (tokens <= config.toolResultThresholdTokens) {
-			return;
+			// No marker — but a re-read still gets its details payload. A
+			// details-only return is applied by the runner without touching
+			// content.
+			return details ? { details } : undefined;
 		}
 
 		const contentString = flattenContent(event.content);
@@ -198,6 +256,7 @@ export default function toolclip(api: ExtensionAPI): void {
 		const marker = buildPendingMarker(event.toolCallId, tokens);
 		return {
 			content: [...event.content, { type: "text" as const, text: marker }],
+			...(details ? { details } : {}),
 		};
 	});
 
@@ -420,8 +479,9 @@ export default function toolclip(api: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 	api.on("before_agent_start", (event: BeforeAgentStartEvent) => {
 		// New round: reset the steering latch so the reminder can fire at most
-		// once for this round.
+		// once for this round, and restart the per-round re-read counter.
 		resetSteering(steering);
+		resetRereads(state.readsThisRound);
 
 		// Defensive: a held payload never survives a round boundary. Live
 		// quarantines are already evicted by the turn_end that closes their

@@ -197,6 +197,166 @@ describe("tool_result handler", () => {
 });
 
 // -----------------------------------------------------------------------
+// re-read observation tests (toolclipReread in read-result details)
+// -----------------------------------------------------------------------
+describe("re-read observation (toolclipReread details)", () => {
+	const LONG = "x".repeat(9000); // 1286 tokens — above the 1000 threshold
+	const SHORT = "x".repeat(500); // below the threshold
+
+	function readEvent(toolCallId: string, path: string, text = LONG, extra: Record<string, unknown> = {}) {
+		return {
+			type: "tool_result",
+			toolCallId,
+			toolName: "read",
+			input: { path },
+			content: [{ type: "text", text }],
+			isError: false,
+			...extra,
+		};
+	}
+
+	it("first read of a path attaches no details", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+
+		const result = invokeHandler(handlers, "tool_result", readEvent("r-1", "/a.ts")) as {
+			content?: unknown;
+			details?: unknown;
+		};
+
+		expect(result).toBeDefined();
+		expect(result.content).toBeDefined(); // marker appended
+		expect(result.details).toBeUndefined();
+	});
+
+	it("second read of the same path attaches toolclipReread with count 2", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+
+		invokeHandler(handlers, "tool_result", readEvent("r-1", "/a.ts"));
+		const result = invokeHandler(handlers, "tool_result", readEvent("r-2", "/a.ts")) as {
+			details: { toolclipReread: { path: string; count: number } };
+		};
+
+		expect(result.details.toolclipReread).toEqual({ path: "/a.ts", count: 2 });
+	});
+
+	it("counts non-consecutive re-reads across the round (3rd read → count 3)", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+
+		invokeHandler(handlers, "tool_result", readEvent("r-1", "/a.ts"));
+		// A different path in between — the counter must not reset.
+		invokeHandler(handlers, "tool_result", readEvent("r-2", "/b.ts"));
+		invokeHandler(handlers, "tool_result", readEvent("r-3", "/a.ts"));
+		const result = invokeHandler(handlers, "tool_result", readEvent("r-4", "/a.ts")) as {
+			details: { toolclipReread: { path: string; count: number } };
+		};
+
+		expect(result.details.toolclipReread).toEqual({ path: "/a.ts", count: 3 });
+	});
+
+	it("different paths are tracked independently", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+
+		invokeHandler(handlers, "tool_result", readEvent("r-1", "/a.ts"));
+		const result = invokeHandler(handlers, "tool_result", readEvent("r-2", "/b.ts")) as {
+			details?: unknown;
+		};
+
+		expect(result.details).toBeUndefined();
+	});
+
+	it("a below-threshold re-read gets a details-only result (content untouched)", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+
+		invokeHandler(handlers, "tool_result", readEvent("r-1", "/small.ts", SHORT));
+		const result = invokeHandler(handlers, "tool_result", readEvent("r-2", "/small.ts", SHORT)) as {
+			content?: unknown;
+			details?: { toolclipReread: { path: string; count: number } };
+		};
+
+		// No pending marker (below threshold), but the re-read is still flagged.
+		expect(result.content).toBeUndefined();
+		expect(result.details?.toolclipReread).toEqual({ path: "/small.ts", count: 2 });
+	});
+
+	it("failed reads (isError) are not counted", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+
+		invokeHandler(handlers, "tool_result", readEvent("r-err", "/a.ts", LONG, { isError: true }));
+		const result = invokeHandler(handlers, "tool_result", readEvent("r-2", "/a.ts")) as {
+			details?: unknown;
+		};
+
+		// The error read did not consume the first-read slot.
+		expect(result.details).toBeUndefined();
+	});
+
+	it("non-read tools are not tracked", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+
+		const grepEvent = {
+			type: "tool_result",
+			toolCallId: "g-1",
+			toolName: "grep",
+			input: { pattern: "x", path: "/a.ts" },
+			content: [{ type: "text", text: LONG }],
+			isError: false,
+		};
+		invokeHandler(handlers, "tool_result", grepEvent);
+		const result = invokeHandler(handlers, "tool_result", { ...grepEvent, toolCallId: "g-2" }) as {
+			details?: unknown;
+		};
+
+		expect(result.details).toBeUndefined();
+	});
+
+	it("merges into existing event details instead of replacing them", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+
+		invokeHandler(handlers, "tool_result", readEvent("r-1", "/a.ts"));
+		const result = invokeHandler(
+			handlers,
+			"tool_result",
+			readEvent("r-2", "/a.ts", LONG, { details: { truncation: { truncated: true } } }),
+		) as {
+			details: Record<string, unknown>;
+		};
+
+		expect(result.details.truncation).toEqual({ truncated: true });
+		expect(result.details.toolclipReread).toEqual({ path: "/a.ts", count: 2 });
+	});
+
+	it("resets the per-round counter at before_agent_start", () => {
+		const { handlers, pi } = createMockApi();
+		toolclip(pi as never);
+
+		invokeHandler(handlers, "tool_result", readEvent("r-1", "/a.ts"));
+		invokeHandler(handlers, "tool_result", readEvent("r-2", "/a.ts")); // count 2
+
+		invokeHandler(handlers, "before_agent_start", {
+			type: "before_agent_start",
+			prompt: "next round",
+			images: undefined,
+			systemPrompt: "base",
+			systemPromptOptions: { cwd: "/x" },
+		});
+
+		// New round: the same path is a first read again.
+		const result = invokeHandler(handlers, "tool_result", readEvent("r-3", "/a.ts")) as {
+			details?: unknown;
+		};
+		expect(result.details).toBeUndefined();
+	});
+});
+
+// -----------------------------------------------------------------------
 // replace_tool_result tool tests
 // -----------------------------------------------------------------------
 describe("replace_tool_result tool", () => {

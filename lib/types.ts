@@ -93,9 +93,12 @@ export interface QuarantineEntry {
  * `entries` tracks replaceable tool results (keyed by tool-call id).
  * `quarantines` tracks held payloads awaiting a (single-turn) read.
  * `currentTurn` mirrors pi's turn index, maintained via `turn_start`.
+ * `readsThisRound` counts successful read results per path within the
+ * current round (re-read observation; reset at each round boundary).
  */
 export interface ToolclipRuntimeState {
 	entries: Map<string, ToolclipRuntimeStateEntry>;
 	quarantines: Map<string, QuarantineEntry>;
 	currentTurn: number;
+	readsThisRound: Map<string, number>;
 }
