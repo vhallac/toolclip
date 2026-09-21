@@ -169,6 +169,29 @@ export function getEntry(
 }
 
 /**
+ * Stamp a stored replacement with the storing call's identity (pointer
+ * mode): the replace call's own toolCallId — whose unmodified arguments
+ * carry the replacement text — and the receipt minted for that call (see
+ * lib/receipt.ts). A re-replacement by a later call overwrites both, so
+ * the pointer names the newest call carrying the current replacement.
+ * No-op when the entry vanished in the meantime (expiry cannot delete a
+ * replaced entry, but defensive symmetry with recordReplacement).
+ */
+export function stampReplacementCall(
+	state: ToolclipRuntimeState,
+	toolCallId: string,
+	replaceCallId: string,
+	receiptId: string,
+): void {
+	const entry = state.entries.get(toolCallId);
+	if (!entry) {
+		return;
+	}
+	entry.replaceCallId = replaceCallId;
+	entry.receiptId = receiptId;
+}
+
+/**
  * Ids that have a pending entry (recorded but not yet replaced). Order is
  * insertion order — useful for diagnostics and tests.
  */

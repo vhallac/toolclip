@@ -57,8 +57,24 @@
  *
  * The `context` event does the actual swap before each LLM call.
  *
+ * Pointer mode (default): the replacement text is kept exactly ONCE in
+ * context — in the arguments of the model's own `replace_tool_result`
+ * call, which are never modified. The swapped original becomes a pointer
+ * naming that call and its receipt (lib/receipt.ts): the model reads the
+ * replacement from its own call's arguments instead of needing a second
+ * copy in the result slot. The receipt id (prefix + random base36 tag +
+ * call counter, e.g. "rp7k2-3") is stamped on the tool's echo and on every
+ * replaced entry, so the pointer resolves through the receipt even when
+ * chat templates hide call ids; a re-replacement re-points the entry at
+ * the newest call. If the pointer's target call is no longer in the
+ * messages (compaction, a fork, another extension), the swap falls back
+ * to the copy form — a pointer must never dangle. Copy mode
+ * (`TOOLCLIP_REPLACEMENT_MODE=copy`) keeps the pre-pointer behavior for
+ * A/B runs (summary text in both places); the mode also shifts the expiry
+ * COPIES/OVERHEAD defaults (1/95 in pointer mode, 2/60 in copy mode).
+ *
  * The LLM is the only actor. There is no auto-summarizer and no auto-eviction.
- */
+  */
 
 import type {
 	ExtensionAPI,
@@ -77,7 +93,12 @@ import { Type } from "@sinclair/typebox";
 import { loadToolclipConfig } from "../lib/toolclip-config.ts";
 import { createRuntimeState } from "../lib/runtime-state.ts";
 import { estimateTokens } from "../lib/tokens.ts";
-import { buildPendingMarker, buildReplacedMarker } from "../lib/marker.ts";
+import { buildPendingMarker, buildReplacedMarker, buildReplacedPointer } from "../lib/marker.ts";
+import {
+	createReceiptState,
+	mintReceipt,
+} from "../lib/receipt.ts";
+import type { ReceiptState } from "../lib/receipt.ts";
 import {
 	recordQuarantine,
 	releaseQuarantine,
@@ -105,7 +126,8 @@ import {
 	recordContextToolCallIds,
 	recordPending,
 	recordReplacement,
-	getReplacement,
+	getEntry,
+	stampReplacementCall,
 } from "../lib/runtime-state.ts";
 import {
 	observeRead,
@@ -230,6 +252,11 @@ export default function toolclip(api: ExtensionAPI): void {
 		writeRatio: config.expiryWriteRatio,
 	});
 	const steering = createSteeringState();
+	// Receipt minting (pointer mode): random session tag drawn once per load
+	// (never persisted), counter starting at 0. The tag keeps receipts minted
+	// after a resume from colliding with the stale echoes in the session
+	// history (see lib/receipt.ts).
+	const receipts: ReceiptState = createReceiptState(config.receiptTagLength);
 
 	// -----------------------------------------------------------------------
 	// 1. tool_result event handler
@@ -392,10 +419,18 @@ export default function toolclip(api: ExtensionAPI): void {
 		};
 	}
 
-	function summarizeResults(results: PairResult[]): string {
+	function summarizeResults(
+		results: PairResult[],
+		receiptId: string | undefined,
+		replaceCallId: string,
+		mode: "pointer" | "copy",
+	): string {
 		// The text lists only actually-stored items; expired ids appear in
 		// neither the Stored nor the Skipped-unknown lines (they remain in
-		// details.results for analysis).
+		// details.results for analysis). In pointer mode the header carries
+		// the receipt — the key the model resolves pointers by — and says the
+		// originals are swapped for a pointer to this call's arguments. Copy
+		// mode keeps the pre-pointer header verbatim (its A/B baseline).
 		const stored = results.filter((r) => r.ok && r.ignored === undefined);
 		const failed = results.filter((r) => !r.ok);
 		if (stored.length === 0 && failed.length === 0) {
@@ -405,10 +440,18 @@ export default function toolclip(api: ExtensionAPI): void {
 		}
 		const lines: string[] = [];
 		if (stored.length > 0) {
-			lines.push(
-				`Stored ${stored.length} replacement${stored.length === 1 ? "" : "s"}. ` +
-					`Originals will be swapped in subsequent LLM calls:`,
-			);
+			if (receiptId !== undefined && mode === "pointer") {
+				lines.push(
+					`Receipt ${receiptId}: stored ${stored.length} replacement${stored.length === 1 ? "" : "s"} ` +
+						`(call ${replaceCallId}). Originals are swapped for a pointer to this call's ` +
+						"arguments in subsequent LLM calls:",
+				);
+			} else {
+				lines.push(
+					`Stored ${stored.length} replacement${stored.length === 1 ? "" : "s"}. ` +
+						`Originals will be swapped in subsequent LLM calls:`,
+				);
+			}
 			for (const r of stored) {
 				lines.push(
 					`  - ${r.toolCallId}: ${r.replacementTokens} tokens ` +
@@ -500,15 +543,36 @@ export default function toolclip(api: ExtensionAPI): void {
 			// A call that stored at least one replacement resets pileTotal to the
 			// sum over the remaining tracked entries (the stored originals left
 			// the pile). A call that stored nothing — all ids expired or unknown
-			// — must NOT reset: the total stays until a real reset.
+			// — must NOT reset: the total stays until a real reset. The receipt
+			// is minted iff at least one item was stored (all stored items share
+			// this call's id and the receipt); a nothing-stored call leaves the
+			// counter untouched.
+			let receiptId: string | undefined;
 			if (results.some((r) => r.ok && r.ignored === undefined)) {
+				receiptId = mintReceipt(receipts, config.receiptPrefix);
+				for (const r of results) {
+					if (r.ok && r.ignored === undefined) {
+						// Stamp the entry with this call's identity so the
+						// pointer-mode swap can name the call that carries
+						// the replacement text.
+						stampReplacementCall(state, r.toolCallId, toolCallId, receiptId);
+					}
+				}
 				resetPileTotalAfterStores(state);
 			}
 			return {
 				content: [
-					{ type: "text" as const, text: summarizeResults(results) },
+					{
+						type: "text" as const,
+						text: summarizeResults(results, receiptId, toolCallId, config.replacementMode),
+					},
 				],
-				details: { ok: true, results },
+				details: {
+					ok: true,
+					results,
+					mode: config.replacementMode,
+					...(receiptId ? { receiptId, replaceCallId: toolCallId } : {}),
+				},
 			};
 		},
 	});
@@ -634,6 +698,12 @@ export default function toolclip(api: ExtensionAPI): void {
 			"  whole result — do not park the full original for later quoting.\n" +
 			"- The only valid reason to keep a marked result un-replaced is that you have not " +
 			"  yet read it. Once you have read it, replace it before moving on.\n" +
+			(config.replacementMode === "pointer"
+				? "A replaced result is shown as [tool-result-replaced: toolCallId=...; ... receipt R]. " +
+					"Nothing is lost: the summary is the `replacement` text you wrote for that toolCallId in " +
+					"the replace_tool_result call whose result carries receipt R (that call sits just above " +
+					"the result). Read it there. Do not re-run the tool to recover it.\n"
+				: "") +
 			"\n## Quarantined Tool Results\n" +
 			`A tool result above ${config.quarantineThresholdTokens} tokens is not shown to you at all: ` +
 			"its content is replaced by a [tool-result-quarantined: ...] notice and the full payload is " +
@@ -676,9 +746,23 @@ export default function toolclip(api: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 	api.on("context", (event: ContextEvent) => {
 		const contextIds: string[] = [];
+		// The ids of the replace calls present in this event's messages —
+		// built once per event, before the swap. A pointer is only applied
+		// when its target call is still here: the replacement text lives in
+		// the call's arguments, so a call removed by compaction (a prefix
+		// cut), a fork, or another extension would leave a dangling pointer.
+		// In that case the swap falls back to the copy form (the stored
+		// replacement text + replaced marker), which never dangles.
+		const presentCallIds = new Set<string>();
 		for (const msg of event.messages) {
 			if (msg.role === "toolResult") {
 				contextIds.push(msg.toolCallId);
+			} else if (msg.role === "assistant") {
+				for (const block of msg.content) {
+					if (block.type === "toolCall" && block.name === "replace_tool_result") {
+						presentCallIds.add(block.id);
+					}
+				}
 			}
 		}
 		recordContextToolCallIds(state, contextIds);
@@ -687,15 +771,42 @@ export default function toolclip(api: ExtensionAPI): void {
 				if (msg.role !== "toolResult") {
 					return msg;
 				}
-				const replacement = getReplacement(state, msg.toolCallId);
-				if (replacement === undefined) {
+				const entry = getEntry(state, msg.toolCallId);
+				if (entry?.replacement === undefined) {
 					return msg;
 				}
-				// Swap content: replacement text + replaced marker
+				// Pointer mode: the original becomes a ONE-block pointer to
+				// the replace call's arguments — the replacement text is NOT
+				// duplicated here, and no separate replaced marker is added
+				// (the pointer itself carries the replaced-marker prefix).
+				if (
+					config.replacementMode === "pointer" &&
+					entry.replaceCallId !== undefined &&
+					entry.receiptId !== undefined &&
+					presentCallIds.has(entry.replaceCallId)
+				) {
+					return {
+						...msg,
+						content: [
+							{
+								type: "text" as const,
+								text: buildReplacedPointer(
+									msg.toolCallId,
+									entry.replaceCallId,
+									entry.receiptId,
+									config.pointerIncludeCallId,
+								),
+							},
+						],
+					};
+				}
+				// Copy mode, and the pointer fallback: replacement text +
+				// replaced marker (covers copy mode, and a replace call the
+				// event no longer carries).
 				return {
 					...msg,
 					content: [
-						{ type: "text" as const, text: replacement },
+						{ type: "text" as const, text: entry.replacement },
 						{ type: "text" as const, text: buildReplacedMarker(msg.toolCallId) },
 					],
 				};

@@ -554,8 +554,17 @@ describe("replace_tool_result tool", () => {
 		expect(results[0]).toMatchObject({ toolCallId: "batch-a", ok: true, grew: false });
 		expect(results[1]).toMatchObject({ toolCallId: "batch-b", ok: true, grew: false });
 		expect(results[2]).toMatchObject({ toolCallId: "no-such-id", ok: false, reason: "unknown id" });
-		// Summary text lists both stored and the skipped unknown.
-		expect(result.content[0].text).toContain("Stored 2 replacements");
+		// Summary text lists both stored and the skipped unknown. Pointer
+		// mode (the default) prefixes the receipt to the header.
+		expect(result.details.mode).toBe("pointer");
+		const receiptId = result.details.receiptId as string;
+		const replaceCallId = result.details.replaceCallId as string;
+		expect(receiptId).toMatch(/^rp[a-z0-9]{3}-1$/);
+		expect(replaceCallId).toBe("call-1");
+		expect(result.content[0].text).toContain(
+			`Receipt ${receiptId}: stored 2 replacements (call call-1).`,
+		);
+		expect(result.content[0].text).toContain("pointer to this call's arguments");
 		expect(result.content[0].text).toContain("batch-a");
 		expect(result.content[0].text).toContain("batch-b");
 		expect(result.content[0].text).toContain("Skipped 1 unknown id");
@@ -1284,7 +1293,9 @@ describe("expiry of stale pending replacements", () => {
 		})) as { content: Array<{ type: string; text: string }>; details: Record<string, unknown> };
 
 		const text = result.content[0].text;
-		expect(text).toContain("Stored 1 replacement");
+		// Only the stored item is listed; the receipt header reflects the
+		// single stored replacement (default pointer mode).
+		expect(text).toContain("stored 1 replacement");
 		expect(text).toContain("- fresh:");
 		expect(text).not.toContain("old");
 		expect(text).not.toContain("Skipped");

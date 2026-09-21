@@ -13,11 +13,15 @@ describe("loadToolclipConfig", () => {
 			expiryRho: 0.2,
 			expiryWriteRatio: 1.0,
 			expiryReplacementTokens: 170,
-			expiryReplacementCopies: 2,
-			expiryOverheadTokens: 60,
+			expiryReplacementCopies: 1,
+			expiryOverheadTokens: 95,
 			expiryHorizonMinTurns: 10,
 			expiryHorizonMaxTurns: 100,
 			expiryAnnounce: true,
+			replacementMode: "pointer",
+			pointerIncludeCallId: true,
+			receiptPrefix: "rp",
+			receiptTagLength: 3,
 		});
 	});
 
@@ -96,11 +100,15 @@ describe("loadToolclipConfig", () => {
 			expiryRho: 0.2,
 			expiryWriteRatio: 1.0,
 			expiryReplacementTokens: 170,
-			expiryReplacementCopies: 2,
-			expiryOverheadTokens: 60,
+			expiryReplacementCopies: 1,
+			expiryOverheadTokens: 95,
 			expiryHorizonMinTurns: 10,
 			expiryHorizonMaxTurns: 100,
 			expiryAnnounce: true,
+			replacementMode: "pointer",
+			pointerIncludeCallId: true,
+			receiptPrefix: "rp",
+			receiptTagLength: 3,
 		});
 	});
 
@@ -142,8 +150,9 @@ describe("loadToolclipConfig", () => {
 			TOOLCLIP_EXPIRY_HORIZON_MAX_TURNS: "",
 		} as NodeJS.ProcessEnv);
 		expect(config.expiryReplacementTokens).toBe(170);
-		expect(config.expiryReplacementCopies).toBe(2);
-		expect(config.expiryOverheadTokens).toBe(60);
+		// Pointer mode (the default) shifts the COPIES/OVERHEAD fallbacks.
+		expect(config.expiryReplacementCopies).toBe(1);
+		expect(config.expiryOverheadTokens).toBe(95);
 		expect(config.expiryHorizonMinTurns).toBe(10);
 		expect(config.expiryHorizonMaxTurns).toBe(100);
 	});

@@ -18,6 +18,16 @@
  *    Format:
  *      [tool-result-replaced: toolCallId=<id>]
  *
+ * 2b. POINTER — the pointer-mode replacement of the whole swapped content:
+ *    one text block naming the replace call whose (unmodified) arguments
+ *    carry the replacement text and the receipt minted for it. Shares the
+ *    REPLACED prefix, so greps for it still find pointers.
+ *
+ *    Format (includeCallId true):
+ *      [tool-result-replaced: toolCallId=<id>; summary is the replacement
+ *       text for this id in your replace_tool_result call <callId>, receipt <rid>]
+ *    (includeCallId false drops the call id after "call".)
+ *
  * 3. (parsing helper) `parsePendingMarker(text)` walks an arbitrary text
  *    blob, finds the first PENDING marker (if any), and returns
  *    `{ toolCallId, tokens }` or `null`. Strict: malformed markers are
@@ -53,6 +63,43 @@ export function buildPendingMarker(toolCallId: string, tokens: number): string {
  */
 export function buildReplacedMarker(toolCallId: string): string {
 	return `${REPLACED_PREFIX} toolCallId=${toolCallId}${REPLACED_SUFFIX}`;
+}
+
+/**
+ * Build the pointer text swapped into a replaced original in pointer mode.
+ *
+ * The replacement text is kept exactly once — in the arguments of the
+ * model's own `replace_tool_result` call, which are never modified — and
+ * this pointer names that call (optionally, see below) and the receipt
+ * minted for it, so the model can read the replacement from its own call
+ * instead of needing a second copy in the result slot.
+ *
+ * The prefix `[tool-result-replaced: toolCallId=<id>` is kept identical to
+ * `buildReplacedMarker`'s output so traceability greps and tests that
+ * match the replaced-marker prefix keep working for pointer text too.
+ *
+ * Deterministic: depends only on the stored state passed in.
+ *
+ * @param toolCallId - The replaced original result's id.
+ * @param replaceCallId - The replace call's own toolCallId whose arguments
+ *   carry the replacement text.
+ * @param receiptId - The receipt minted for that call (always present —
+ *   the reliable key when chat templates hide call ids).
+ * @param includeCallId - Include the replace call's toolCallId after
+ *   "call"; false drops it (receipt only).
+ */
+export function buildReplacedPointer(
+	toolCallId: string,
+	replaceCallId: string,
+	receiptId: string,
+	includeCallId: boolean,
+): string {
+	const callPart = includeCallId ? ` ${replaceCallId}` : "";
+	return (
+		`${REPLACED_PREFIX} toolCallId=${toolCallId}; ` +
+		"summary is the replacement text for this id in your replace_tool_result" +
+		` call${callPart}, receipt ${receiptId}${REPLACED_SUFFIX}`
+	);
 }
 
 /**

@@ -22,6 +22,13 @@ const DEFAULT_STEERING_FIRST_RUNG_TOKENS = 5000;
  */
 const DEFAULT_QUARANTINE_THRESHOLD_TOKENS = 10000;
 
+/** Mode-dependent expiry defaults: with the replacement text kept once (pointer mode)
+ * the per-turn saving formula sees one copy and a slightly larger overhead —
+ * the pointer (~35 tokens) replaces the old two-block replaced marker (~29 tokens).
+ * Copy mode keeps the original defaults. An explicit env value always wins. */
+const POINTER_MODE_DEFAULTS = { copies: 1, overhead: 95 };
+const COPY_MODE_DEFAULTS = { copies: 2, overhead: 60 };
+
 function parseBool(value: string | undefined, fallback: boolean): boolean {
 	if (value === undefined) {
 		return fallback;
@@ -50,6 +57,28 @@ function parseNumber(value: string | undefined, fallback: number, min: number): 
 		return fallback;
 	}
 	return n;
+}
+
+/** Parse a non-negative integer (rejects negatives and non-integers). Used for the
+ * receipt tag length, where 0 is meaningful ("disable the tag"). */
+function parseNonNegativeInt(value: string | undefined, fallback: number): number {
+	if (value === undefined) {
+		return fallback;
+	}
+	const n = Number(value);
+	if (!Number.isFinite(n) || n < 0 || !Number.isInteger(n)) {
+		return fallback;
+	}
+	return n;
+}
+
+/**
+ * Parse the replacement mode. "copy" opts into the pre-pointer swap
+ * (summary text in both places — for A/B runs); every other value,
+ * including unset, means the "pointer" default.
+ */
+function parseMode(value: string | undefined): "pointer" | "copy" {
+	return value !== undefined && value.toLowerCase() === "copy" ? "copy" : "pointer";
 }
 
 /**
@@ -101,8 +130,34 @@ function parseNumber(value: string | undefined, fallback: number, min: number): 
  * without cache activity freeze expiry. Expiry never modifies `pileTotal`
  * (the ladder's total) and is monotone — expired ids are never re-armed.
  * Gated by `TOOLCLIP_EXPIRY` (false: no expiry, ladder-only).
+ *
+ * Replacement mode (pointer vs copy): the replacement text is kept exactly
+ * ONCE in context — in the model's own `replace_tool_result` call
+ * arguments, which are never modified. On subsequent LLM calls a replaced
+ * original is swapped for a pointer naming that call and its receipt:
+ * `[tool-result-replaced: toolCallId=x; summary is the replacement text for
+ * this id in your replace_tool_result call call_A, receipt rp7k2-1]`. The
+ * receipt (prefix + random base36 tag + call counter, e.g. "rp7k2-3") is
+ * stamped on the tool's echo — "Receipt rp7k2-1: stored 2 replacement(s)
+ * (call call_A). Originals are swapped for a pointer to this call's
+ * arguments in subsequent LLM calls:" — and on every replaced entry, so
+ * the model resolves the pointer via the call whose result carries the
+ * same receipt (the reliable key: some chat templates never show call
+ * ids). A re-replacement re-points the entry at the newest call. If the
+ * pointer's target call is no longer in the messages (compaction, a fork,
+ * another extension), the swap falls back to the copy form — a pointer
+ * must never dangle. Copy mode (`TOOLCLIP_REPLACEMENT_MODE=copy`) keeps
+ * the pre-pointer behavior for A/B runs: the summary text is written in
+ * both places (swapped result and call args), the echo keeps its old
+ * header, and the receipt is minted only into details. The mode also
+ * shifts the expiry defaults — pointer: COPIES 1, OVERHEAD 95 (the
+ * pointer replaces the old two-block marker); copy: COPIES 2, OVERHEAD
+ * 60 — with an explicit env value always winning.
  */
 export function loadToolclipConfig(env: NodeJS.ProcessEnv = process.env): ToolclipConfig {
+	const replacementMode = parseMode(env.TOOLCLIP_REPLACEMENT_MODE);
+	const expiryDefaults =
+		replacementMode === "pointer" ? POINTER_MODE_DEFAULTS : COPY_MODE_DEFAULTS;
 	return {
 		toolResultThresholdTokens: parsePositiveInt(
 			env.TOOLCLIP_TOOL_RESULT_THRESHOLD_TOKENS,
@@ -122,10 +177,23 @@ export function loadToolclipConfig(env: NodeJS.ProcessEnv = process.env): Toolcl
 		expiryRho: parseNumber(env.TOOLCLIP_EXPIRY_RHO, DEFAULT_EXPIRY_RHO, 0),
 		expiryWriteRatio: parseNumber(env.TOOLCLIP_EXPIRY_WRITE_RATIO, DEFAULT_EXPIRY_WRITE_RATIO, 0),
 		expiryReplacementTokens: parsePositiveInt(env.TOOLCLIP_EXPIRY_REPLACEMENT_TOKENS, 170),
-		expiryReplacementCopies: parsePositiveInt(env.TOOLCLIP_EXPIRY_REPLACEMENT_COPIES, 2),
-		expiryOverheadTokens: parsePositiveInt(env.TOOLCLIP_EXPIRY_OVERHEAD_TOKENS, 60),
+		expiryReplacementCopies: parsePositiveInt(
+			env.TOOLCLIP_EXPIRY_REPLACEMENT_COPIES,
+			expiryDefaults.copies,
+		),
+		expiryOverheadTokens: parsePositiveInt(
+			env.TOOLCLIP_EXPIRY_OVERHEAD_TOKENS,
+			expiryDefaults.overhead,
+		),
 		expiryHorizonMinTurns: parsePositiveInt(env.TOOLCLIP_EXPIRY_HORIZON_MIN_TURNS, 10),
 		expiryHorizonMaxTurns: parsePositiveInt(env.TOOLCLIP_EXPIRY_HORIZON_MAX_TURNS, 100),
 		expiryAnnounce: parseBool(env.TOOLCLIP_EXPIRY_ANNOUNCE, true),
+		replacementMode,
+		pointerIncludeCallId: parseBool(env.TOOLCLIP_POINTER_INCLUDE_CALL_ID, true),
+		receiptPrefix:
+			env.TOOLCLIP_RECEIPT_PREFIX !== undefined && env.TOOLCLIP_RECEIPT_PREFIX.length > 0
+				? env.TOOLCLIP_RECEIPT_PREFIX
+				: "rp",
+		receiptTagLength: parseNonNegativeInt(env.TOOLCLIP_RECEIPT_TAG_LENGTH, 3),
 	};
 }

@@ -78,15 +78,20 @@ export interface ToolclipConfig {
 	 */
 	expiryReplacementTokens: number;
 	/**
-	 * How many copies of the replacement text sit in context: 2 while the
-	 * replace call's args are kept (args + swapped result), 1 after a future
-	 * arg stubbing. Defaults to `2`. Gated by
-	 * `TOOLCLIP_EXPIRY_REPLACEMENT_COPIES`.
+	 * How many copies of the replacement text sit in context: 2 in copy mode
+	 * (args + swapped result both carry the text), 1 in pointer mode (the
+	 * text lives once, in the replace call's args; the swapped result is a
+	 * pointer). Defaults follow the mode: `1` in pointer mode, `2` in copy
+	 * mode. Gated by `TOOLCLIP_EXPIRY_REPLACEMENT_COPIES` (an explicit env
+	 * value always wins).
 	 */
 	expiryReplacementCopies: number;
 	/**
 	 * Fixed tokens per replacement not otherwise counted (call block, ids,
-	 * echo). Defaults to `60`. Gated by `TOOLCLIP_EXPIRY_OVERHEAD_TOKENS`.
+	 * echo). Defaults follow the mode: `95` in pointer mode (60 + ~35 for
+	 * the pointer replacing the old replaced marker), `60` in copy mode.
+	 * Gated by `TOOLCLIP_EXPIRY_OVERHEAD_TOKENS` (an explicit env value
+	 * always wins).
 	 */
 	expiryOverheadTokens: number;
 	/**
@@ -105,6 +110,38 @@ export interface ToolclipConfig {
 	 * `true`. Gated by `TOOLCLIP_EXPIRY_ANNOUNCE`.
 	 */
 	expiryAnnounce: boolean;
+	/**
+	 * How a replaced original is presented on subsequent LLM calls.
+	 *
+	 * "pointer" (default): the replacement text is kept exactly ONCE in
+	 * context — in the model's own replace call arguments, which are never
+	 * modified — and the swapped original becomes a pointer naming that call
+	 * and its receipt (see lib/receipt.ts). If the pointer's target call is
+	 * no longer in the messages (compaction, a fork, another extension), the
+	 * swap falls back to the copy form — a pointer must never dangle.
+	 *
+	 * "copy": today's behavior — the summary text is written in both places
+	 * (the swapped result and the call args). Use for A/B runs.
+	 *
+	 * Gated by `TOOLCLIP_REPLACEMENT_MODE`.
+	 */
+	replacementMode: "pointer" | "copy";
+	/**
+	 * Whether the pointer text names the replace call's toolCallId. Some
+	 * chat templates never show call ids to the model; the receipt is always
+	 * included and is the reliable key. Defaults to `true`. Gated by
+	 * `TOOLCLIP_POINTER_INCLUDE_CALL_ID`.
+	 */
+	pointerIncludeCallId: boolean;
+	/** Prefix of the receipt id ("rp7k2-3" → prefix "rp"). Defaults to `"rp"`. Gated by `TOOLCLIP_RECEIPT_PREFIX`. */
+	receiptPrefix: string;
+	/**
+	 * Random base36 characters in the receipt id, generated once per
+	 * extension load so receipts stay unique after a resume (the counter
+	 * restarts). `0` disables the tag. Defaults to `3`. Gated by
+	 * `TOOLCLIP_RECEIPT_TAG_LENGTH`.
+	 */
+	receiptTagLength: number;
 }
 
 /**
@@ -126,6 +163,13 @@ export interface ToolclipConfig {
  * appended since (S_i = ctx_t - ctxSeen) can be compared against the
  * pay-back threshold later. `pileTotal` accumulates the entry's
  * `originalTokens` at the same moment.
+ *
+ * `replaceCallId`/`receiptId` (pointer mode) name the `replace_tool_result`
+ * call whose arguments carry the replacement text and the receipt id minted
+ * for that call (see lib/receipt.ts). Stamped on every entry the call
+ * stored; a re-replacement overwrites both — the pointer then names the
+ * newest call. Only read by the pointer-mode context swap; recorded in
+ * every mode so the state shape does not depend on the mode.
  */
 export interface ToolclipRuntimeStateEntry {
 	originalTokens: number;
@@ -137,6 +181,10 @@ export interface ToolclipRuntimeStateEntry {
 	counted: boolean;
 	/** Request context size (ctx_t) at the turn_end where the entry was counted. 0 until counted. */
 	ctxSeen: number;
+	/** The replace call's own toolCallId whose arguments carry the replacement text. */
+	replaceCallId?: string;
+	/** Receipt id minted for that storing call (see lib/receipt.ts). */
+	receiptId?: string;
 }
 
 /**
