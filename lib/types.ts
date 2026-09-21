@@ -142,6 +142,16 @@ export interface ToolclipConfig {
 	 * `TOOLCLIP_RECEIPT_TAG_LENGTH`.
 	 */
 	receiptTagLength: number;
+	/**
+	 * Text stored in place of an empty or whitespace-only replacement — the
+	 * model's way to say "the result was useless". The original is swapped
+	 * in place for this text plus the replaced marker (no pointer, no
+	 * receipt stamp: nothing was stored in the replace call's arguments),
+	 * and a placeholder never feeds the expiry R (replMeanTokens). Defaults
+	 * to `"tool result was not useful"`. Gated by
+	 * `TOOLCLIP_EMPTY_REPLACEMENT_TEXT`.
+	 */
+	emptyReplacementText: string;
 }
 
 /**

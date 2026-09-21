@@ -194,11 +194,15 @@ export function stampReplacementCall(
 /**
  * Ids that have a pending entry (recorded but not yet replaced). Order is
  * insertion order — useful for diagnostics and tests.
+ *
+ * The check is against `undefined`, not falsiness: the stored placeholder
+ * for an empty ("the result was useless") replacement may itself be an
+ * empty string, and such an entry is replaced, not pending.
  */
 export function pendingIds(state: ToolclipRuntimeState): string[] {
 	const ids: string[] = [];
 	for (const [id, entry] of state.entries) {
-		if (!entry.replacement) {
+		if (entry.replacement === undefined) {
 			ids.push(id);
 		}
 	}

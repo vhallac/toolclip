@@ -22,6 +22,7 @@ describe("loadToolclipConfig", () => {
 			pointerIncludeCallId: true,
 			receiptPrefix: "rp",
 			receiptTagLength: 3,
+			emptyReplacementText: "tool result was not useful",
 		});
 	});
 
@@ -109,6 +110,7 @@ describe("loadToolclipConfig", () => {
 			pointerIncludeCallId: true,
 			receiptPrefix: "rp",
 			receiptTagLength: 3,
+			emptyReplacementText: "tool result was not useful",
 		});
 	});
 
@@ -166,5 +168,21 @@ describe("loadToolclipConfig", () => {
 	it("disables the expired-ids announce via TOOLCLIP_EXPIRY_ANNOUNCE=false", () => {
 		const config = loadToolclipConfig({ TOOLCLIP_EXPIRY_ANNOUNCE: "false" } as NodeJS.ProcessEnv);
 		expect(config.expiryAnnounce).toBe(false);
+	});
+
+	it("honors TOOLCLIP_EMPTY_REPLACEMENT_TEXT, defaulting to the useless-result placeholder", () => {
+		expect(loadToolclipConfig({} as NodeJS.ProcessEnv).emptyReplacementText).toBe(
+			"tool result was not useful",
+		);
+		const custom = loadToolclipConfig({
+			TOOLCLIP_EMPTY_REPLACEMENT_TEXT: "checked, found nothing",
+		} as NodeJS.ProcessEnv);
+		expect(custom.emptyReplacementText).toBe("checked, found nothing");
+		// An explicit empty string is honored (the stored placeholder may
+		// itself be empty; the pending check is against undefined).
+		const blank = loadToolclipConfig({
+			TOOLCLIP_EMPTY_REPLACEMENT_TEXT: "",
+		} as NodeJS.ProcessEnv);
+		expect(blank.emptyReplacementText).toBe("");
 	});
 });

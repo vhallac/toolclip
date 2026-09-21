@@ -380,6 +380,8 @@ export default function toolclip(api: ExtensionAPI): void {
 		originalTokens?: number;
 		replacementTokens?: number;
 		grew?: boolean;
+		/** True when an empty (useless-result) replacement was substituted with the placeholder text. */
+		substituted?: boolean;
 	}
 
 	function applyOne(pair: ReplacePair): PairResult {
@@ -401,6 +403,33 @@ export default function toolclip(api: ExtensionAPI): void {
 				toolCallId: pair.toolCallId,
 				ok: false,
 				reason: "unknown id",
+			};
+		}
+		// An empty (or whitespace-only) replacement says "the result was
+		// useless": nothing was extractable, so the placeholder text is
+		// stored in place and the entry is NOT stamped — the context swap then
+		// uses the in-place form (placeholder + replaced marker, never a
+		// pointer), no receipt is minted for it, and observeReplacement is
+		// skipped on purpose (a placeholder must not pull the expiry R —
+		// replMeanTokens — down). The store still counts as stored: the
+		// original leaves the pile.
+		if (pair.replacement.trim().length === 0) {
+			const placeholderTokens = estimateTokens(config.emptyReplacementText);
+			recordReplacement(state, pair.toolCallId, config.emptyReplacementText, placeholderTokens);
+			entry.grew = false;
+			// Clear any pointer stamps: the swap must fall back to the
+			// in-place form even when an earlier (non-empty) call stamped the
+			// entry — a pointer would name a call whose args no longer carry
+			// the current (placeholder) replacement.
+			entry.replaceCallId = undefined;
+			entry.receiptId = undefined;
+			return {
+				toolCallId: pair.toolCallId,
+				ok: true,
+				substituted: true,
+				originalTokens: entry.originalTokens,
+				replacementTokens: placeholderTokens,
+				grew: false,
 			};
 		}
 		const replacementTokens = estimateTokens(pair.replacement);
@@ -454,8 +483,11 @@ export default function toolclip(api: ExtensionAPI): void {
 			}
 			for (const r of stored) {
 				lines.push(
-					`  - ${r.toolCallId}: ${r.replacementTokens} tokens ` +
-						`(was ${r.originalTokens}${r.grew ? ", grew" : ""})`,
+					r.substituted
+						? `  - ${r.toolCallId}: ${r.replacementTokens} tokens ` +
+							`(was ${r.originalTokens}), empty replacement stored as "${config.emptyReplacementText}"`
+						: `  - ${r.toolCallId}: ${r.replacementTokens} tokens ` +
+							`(was ${r.originalTokens}${r.grew ? ", grew" : ""})`,
 				);
 			}
 		}
@@ -542,22 +574,27 @@ export default function toolclip(api: ExtensionAPI): void {
 			const results = pairs.map(applyOne);
 			// A call that stored at least one replacement resets pileTotal to the
 			// sum over the remaining tracked entries (the stored originals left
-			// the pile). A call that stored nothing — all ids expired or unknown
-			// — must NOT reset: the total stays until a real reset. The receipt
-			// is minted iff at least one item was stored (all stored items share
-			// this call's id and the receipt); a nothing-stored call leaves the
+			// the pile) — a substituted store (empty replacement → placeholder
+			// in place) counts as a store for this reset. A call that stored
+			// nothing — all ids expired or unknown — must NOT reset: the total
+			// stays until a real reset. The receipt is minted and the entries
+			// stamped only for the items whose replacement text this call's
+			// arguments actually carry: a substituted item was stored in place
+			// (no pointer, no stamp), and a call that stamps nothing leaves the
 			// counter untouched.
+			const stored = results.filter((r) => r.ok && r.ignored === undefined);
+			const stampedItems = stored.filter((r) => !r.substituted);
 			let receiptId: string | undefined;
-			if (results.some((r) => r.ok && r.ignored === undefined)) {
+			if (stampedItems.length > 0) {
 				receiptId = mintReceipt(receipts, config.receiptPrefix);
-				for (const r of results) {
-					if (r.ok && r.ignored === undefined) {
-						// Stamp the entry with this call's identity so the
-						// pointer-mode swap can name the call that carries
-						// the replacement text.
-						stampReplacementCall(state, r.toolCallId, toolCallId, receiptId);
-					}
+				for (const r of stampedItems) {
+					// Stamp the entry with this call's identity so the
+					// pointer-mode swap can name the call that carries
+					// the replacement text.
+					stampReplacementCall(state, r.toolCallId, toolCallId, receiptId);
 				}
+			}
+			if (stored.length > 0) {
 				resetPileTotalAfterStores(state);
 			}
 			return {

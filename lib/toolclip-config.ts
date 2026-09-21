@@ -29,6 +29,10 @@ const DEFAULT_QUARANTINE_THRESHOLD_TOKENS = 10000;
 const POINTER_MODE_DEFAULTS = { copies: 1, overhead: 95 };
 const COPY_MODE_DEFAULTS = { copies: 2, overhead: 60 };
 
+/** Text stored in place of an empty or whitespace-only replacement (the model's
+ * "the result was useless" signal). */
+const DEFAULT_EMPTY_REPLACEMENT_TEXT = "tool result was not useful";
+
 function parseBool(value: string | undefined, fallback: boolean): boolean {
 	if (value === undefined) {
 		return fallback;
@@ -153,6 +157,12 @@ function parseMode(value: string | undefined): "pointer" | "copy" {
  * shifts the expiry defaults — pointer: COPIES 1, OVERHEAD 95 (the
  * pointer replaces the old two-block marker); copy: COPIES 2, OVERHEAD
  * 60 — with an explicit env value always winning.
+ *
+ * Empty-replacement placeholder: an empty or whitespace-only replacement
+ * means "the result was useless" — the placeholder text
+ * (`TOOLCLIP_EMPTY_REPLACEMENT_TEXT`, default "tool result was not useful")
+ * is stored in place and swapped in with the replaced marker (no pointer,
+ * no receipt stamp; it never feeds the expiry R).
  */
 export function loadToolclipConfig(env: NodeJS.ProcessEnv = process.env): ToolclipConfig {
 	const replacementMode = parseMode(env.TOOLCLIP_REPLACEMENT_MODE);
@@ -195,5 +205,9 @@ export function loadToolclipConfig(env: NodeJS.ProcessEnv = process.env): Toolcl
 				? env.TOOLCLIP_RECEIPT_PREFIX
 				: "rp",
 		receiptTagLength: parseNonNegativeInt(env.TOOLCLIP_RECEIPT_TAG_LENGTH, 3),
+		emptyReplacementText:
+			env.TOOLCLIP_EMPTY_REPLACEMENT_TEXT !== undefined
+				? env.TOOLCLIP_EMPTY_REPLACEMENT_TEXT
+				: DEFAULT_EMPTY_REPLACEMENT_TEXT,
 	};
 }
