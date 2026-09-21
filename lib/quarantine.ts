@@ -6,23 +6,25 @@
  * the LLM: the tool_result handler swaps in a notice and the full payload is
  * held here, keyed by the original tool call id.
  *
- * Lifetime ("use it or lose it"): the LLM first sees the notice when it
- * generates the turn AFTER the one in which the result was quarantined
- * (`createdTurn + 1`). A `read_quarantined_result` call issued during that
- * turn is honored (the payload is released and handed back). At the
- * `turn_end` of that turn, any still-held entry is evicted — later read
- * attempts for the id are denied.
+ * Lifetime ("held until read; freed after reading"): payloads are held for
+ * the session's lifetime — there is no eviction. The LLM first sees the
+ * notice when it generates the turn AFTER the one in which the result was
+ * quarantined (`createdTurn + 1`), because pi delivers a turn's tool results
+ * at that turn's `turn_end` — but the notice starts no countdown: a
+ * `read_quarantined_result` call is honored at any later turn. A successful
+ * read releases (destroys) the payload.
  *
- * Why this window: pi delivers all of a turn's tool results at that turn's
- * `turn_end`; the LLM cannot react to a quarantine notice within the same
- * turn it was created. The first turn in which a read is even possible is
- * `createdTurn + 1` — giving the payload exactly one turn of opportunity
- * keeps the held data from silently accumulating across a session.
- *
- * Eviction rule: at `turn_end` with turnIndex R, evict entries with
- * `createdTurn <= R - 1`. An entry created during turn R survives its own
- * turn_end (it could not have been read yet), gets its opportunity in turn
- * R + 1, and is evicted at that turn's end if still unread.
+ * Why no eviction: the session file holds only the notice — the in-memory
+ * payload is the only copy, so eviction was permanent data destruction. The
+ * former one-turn read window ("use it or lose it") collided with the
+ * steering nag in the 2026-09-20 golden run: the nag consumed the single
+ * read-window turn, the eviction then destroyed a payload the model
+ * genuinely needed, and the model re-fetched it in 11 piecemeal reads. Held
+ * payloads cost a few hundred KB per run at most — host RAM is not the
+ * scarce resource; irreversibly destroyed context is. The natural brake
+ * survives: a read re-enters the pending path (huge by construction →
+ * pending marker → must be distilled), so re-reading stale data later is
+ * possible but deliberately costly.
  *
  * Operations are pure functions that take a `ToolclipRuntimeState` and
  * mutate its `quarantines` Map. No I/O, no pi deps — mirrors runtime-state.
@@ -71,33 +73,14 @@ export function releaseQuarantine(
 }
 
 /**
- * Evict held entries whose one-turn read window has closed: entries
- * quarantined in a strictly earlier turn than the one just ending. Returns
- * the evicted ids (useful for diagnostics and tests).
- *
- * @param state - The runtime state to mutate.
- * @param turnIndex - The turn index of the `turn_end` being processed.
- */
-export function evictExpiredQuarantines(
-	state: ToolclipRuntimeState,
-	turnIndex: number,
-): string[] {
-	const evicted: string[] = [];
-	for (const [id, entry] of state.quarantines) {
-		if (entry.createdTurn <= turnIndex - 1) {
-			state.quarantines.delete(id);
-			evicted.push(id);
-		}
-	}
-	return evicted;
-}
-
-/**
  * Build the notice swapped into a quarantined result's LLM-facing content.
  * Carries the marker (parseable identity) plus the guidance: narrow the
  * call when only part of the data is needed; read the held payload once,
  * in full, when all of it is needed — never reconstruct it piecemeal with
- * several narrowed calls (that costs more than one read).
+ * several narrowed calls (that costs more than one read). No urgency
+ * language: the payload is held until read, so the model can act on the
+ * steering nag first without losing the data (the collision that destroyed
+ * a payload in the 2026-09-20 golden run).
  *
  * @param toolCallId - The tool call id whose result was withheld.
  * @param tokens - Estimated token count of the held payload.
@@ -108,20 +91,22 @@ export function buildQuarantineNotice(toolCallId: string, tokens: number): strin
 		"\n" +
 		"This result was withheld from your context (too large). Choose deliberately:\n" +
 		"1. If you only need part of the data: re-issue the tool call with a narrower scope (specific file, tighter pattern, smaller range) so the result comes back small.\n" +
-		`2. If you need the whole payload: call read_quarantined_result({ toolCallId: "${toolCallId}" }) once, in your very next response. Do NOT reconstruct the payload piecemeal with several narrowed calls — that costs more calls and more tokens than one full read.\n` +
-		"This is your only chance — the held data is freed right after that response, and later read attempts for it are denied."
+		`2. If you need the whole payload: call read_quarantined_result({ toolCallId: "${toolCallId}" }) once. Do NOT reconstruct the payload piecemeal with several narrowed calls — that costs more calls and more tokens than one full read.\n` +
+		"The payload is held until you read it; the read frees it, so a second read of the same id is denied."
 	);
 }
 
 /**
- * Build the denial text returned when a read targets an id that is no
- * longer held.
+ * Build the denial text returned when a read targets an id that is not
+ * held — the payload was already read and released.
+ *
+ * @param toolCallId - The id that was requested.
  */
 export function buildQuarantineMissedNotice(toolCallId: string): string {
 	return (
 		buildQuarantineMissedMarker(toolCallId) +
 		"\n" +
-		"The quarantined payload was already freed (read earlier, or its one-turn window expired). " +
+		"The quarantined payload was already read — a read releases and frees it. " +
 		"It is no longer retrievable. Re-run the original tool call with a narrower scope to regenerate the data you need."
 	);
 }
@@ -131,12 +116,4 @@ export function buildQuarantineMissedNotice(toolCallId: string): string {
  */
 export function quarantineIds(state: ToolclipRuntimeState): string[] {
 	return [...state.quarantines.keys()];
-}
-
-/**
- * Wipe all held entries. Used defensively at round boundaries (a new agent
- * run never inherits a read window from a previous round).
- */
-export function clearQuarantines(state: ToolclipRuntimeState): void {
-	state.quarantines.clear();
 }

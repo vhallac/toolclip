@@ -73,9 +73,9 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
  *
  * Quarantine: results above `quarantineThresholdTokens` (default 10000) are
  * withheld from the LLM entirely — the content is swapped for a notice and
- * the payload is held for exactly one turn, retrievable via
- * `read_quarantined_result` ("use it or lose it"). Disable to fall back to
- * plain pending markers for all sizes.
+ * the payload is held in memory until read, retrievable via
+ * `read_quarantined_result` ("held until read; freed after reading").
+ * Disable to fall back to plain pending markers for all sizes.
  */
 export function loadToolclipConfig(env: NodeJS.ProcessEnv = process.env): ToolclipConfig {
 	return {

@@ -1,14 +1,17 @@
 /**
  * Extension-level tests for the quarantine flow.
  *
- * Drives the mock pi event bus through the "use it or lose it" contract:
+ * Drives the mock pi event bus through the "held until read; freed after
+ * reading" contract:
  *   1. A tool result above the quarantine threshold (10000 tokens) is
  *      withheld: content swapped for a notice, payload held, no pending
  *      entry (there is nothing in context to replace).
- *   2. The read in the turn right after the quarantine is honored — the
- *      read's own result re-enters the normal pending-marker path
- *      (replaceable, never re-quarantined).
- *   3. After the window's turn_end, read attempts are denied.
+ *   2. A read is honored at any later turn — there is no one-turn window
+ *      and no eviction; the read's own result re-enters the normal
+ *      pending-marker path (replaceable, never re-quarantined).
+ *   3. After a read releases the payload, later reads for the id are
+ *      denied.
+ *   4. Held payloads survive round boundaries.
  */
 
 import { describe, expect, it, vi, afterEach } from "vitest";
@@ -96,7 +99,7 @@ describe("toolclip quarantine — tool_result handling", () => {
 	});
 });
 
-describe("toolclip quarantine — the one-turn read window", () => {
+describe("toolclip quarantine — read/release cycle (session-lifetime hold)", () => {
 	it("honors an immediate read in the turn after the quarantine, even alongside other tool calls", async () => {
 		const { handlers, tools, pi } = createMockApi();
 		toolclip(pi as never);
@@ -131,7 +134,8 @@ describe("toolclip quarantine — the one-turn read window", () => {
 		})) as { details: Record<string, unknown> };
 		expect(replace.details).toMatchObject({ ok: true });
 
-		// turn_end of turn 1: the window closes; nothing stale remains.
+		// turn_end of turn 1: nothing is evicted — the payload was already
+		// released by the read.
 		invokeHandler(handlers, "turn_end", {
 			type: "turn_end",
 			turnIndex: 1,
@@ -141,17 +145,19 @@ describe("toolclip quarantine — the one-turn read window", () => {
 		// A late second read for the original id is denied.
 		const late = (await invokeTool(tools, "read_quarantined_result", "read-2", {
 			toolCallId: "bash-1",
-		})) as { details: Record<string, unknown> };
+		})) as { details: Record<string, unknown>; content: Array<{ type: string; text: string }> };
 		expect(late.details).toMatchObject({ ok: false });
+		expect(late.content[0].text).toContain("already read");
 	});
 
-	it("denies a read after the window's turn_end (use it or lose it)", async () => {
+	it("honors a read many turns later — no eviction at turn boundaries", async () => {
 		const { handlers, tools, pi } = createMockApi();
 		toolclip(pi as never);
 		invokeHandler(handlers, "turn_start", { type: "turn_start", turnIndex: 0, timestamp: 0 });
 		invokeHandler(handlers, "tool_result", toolResultEvent("bash-1", QUAR_TEXT));
 
-		// Turn 1 passes without a read; its turn_end frees the payload.
+		// Turn 1 passes without a read: turn boundaries hold nothing back and
+		// evict nothing.
 		invokeHandler(handlers, "turn_start", { type: "turn_start", turnIndex: 1, timestamp: 1 });
 		invokeHandler(handlers, "turn_end", {
 			type: "turn_end",
@@ -160,13 +166,14 @@ describe("toolclip quarantine — the one-turn read window", () => {
 			toolResults: [],
 		});
 
+		// Turn 2: the model finally wants the full payload — still held.
+		invokeHandler(handlers, "turn_start", { type: "turn_start", turnIndex: 2, timestamp: 2 });
 		const late = (await invokeTool(tools, "read_quarantined_result", "read-1", {
 			toolCallId: "bash-1",
 		})) as { content: Array<{ type: string; text: string }>; details: Record<string, unknown> };
 
-		expect(late.details).toMatchObject({ ok: false });
-		expect(late.content[0].text).toContain("[quarantine-missed: toolCallId=bash-1]");
-		expect(late.content[0].text).not.toContain(QUAR_TEXT);
+		expect(late.details).toMatchObject({ ok: true, toolCallId: "bash-1", tokens: 64276 });
+		expect(late.content[0].text).toBe(QUAR_TEXT);
 	});
 
 	it("a read in the same turn the quarantine was created is impossible — but a same-turn-end batch still honors the read issued in the next turn", async () => {
@@ -204,23 +211,25 @@ describe("toolclip quarantine — the one-turn read window", () => {
 		expect(replace.details.results[0]).toMatchObject({ ok: false, reason: "unknown id" });
 	});
 
-	it("a new round clears held payloads (never inherited across round boundaries)", async () => {
+	it("held payloads survive a round boundary (read honored after before_agent_start)", async () => {
 		const { handlers, tools, pi } = createMockApi();
 		toolclip(pi as never);
 		invokeHandler(handlers, "turn_start", { type: "turn_start", turnIndex: 0, timestamp: 0 });
 		invokeHandler(handlers, "tool_result", toolResultEvent("bash-1", QUAR_TEXT));
 
 		// A new round starts (before_agent_start) — e.g. the previous run was
-		// aborted before its window closed.
+		// aborted. Held payloads are NOT cleared: they are held for the
+		// session's lifetime, and the read is still honored.
 		invokeHandler(handlers, "before_agent_start", {
 			type: "before_agent_start",
 			systemPrompt: "base",
 			messages: [],
 		});
-		const late = (await invokeTool(tools, "read_quarantined_result", "read-1", {
+		const read = (await invokeTool(tools, "read_quarantined_result", "read-1", {
 			toolCallId: "bash-1",
-		})) as { details: Record<string, unknown> };
-		expect(late.details).toMatchObject({ ok: false });
+		})) as { content: Array<{ type: string; text: string }>; details: Record<string, unknown> };
+		expect(read.details).toMatchObject({ ok: true, toolCallId: "bash-1", tokens: 64276 });
+		expect(read.content[0].text).toBe(QUAR_TEXT);
 	});
 });
 
@@ -243,6 +252,11 @@ describe("toolclip quarantine — system prompt", () => {
 		// instead of reconstructing it with partial fetches.
 		expect(result.systemPrompt).toContain("read it from the quarantine — do NOT reconstruct it");
 		expect(result.systemPrompt).toContain("offset/limit chunks");
+		// Hold-until-read semantics, stated neutrally (no deadline — the
+		// former urgency collided with the steering nag).
+		expect(result.systemPrompt).toContain("held until you read it");
+		expect(result.systemPrompt).not.toContain("immediately next response");
+		expect(result.systemPrompt).not.toContain("held for exactly one");
 	});
 });
 

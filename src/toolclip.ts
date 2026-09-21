@@ -24,8 +24,11 @@
  *
  * Quarantine: results above the much higher `quarantineThresholdTokens`
  * (default 10000) are withheld from the LLM entirely — content swapped for
- * a `[tool-result-quarantined: ...]` notice, payload held for exactly one
- * turn ("use it or lose it"), retrievable via the registered
+ * a `[tool-result-quarantined: ...]` notice, payload held in memory until
+ * read ("held until read; freed after reading" — no eviction: the session
+ * file holds only the notice, so the in-memory payload is the only copy,
+ * and the former one-turn window destroyed exactly the payload the model
+ * needed in the 2026-09-20 golden run), retrievable via the registered
  * `read_quarantined_result` tool. The read's own result re-enters the
  * normal pending-marker path (it is replaceable), never re-quarantined —
  * that would be a loop. Both the notice and the system-prompt section tell
@@ -66,10 +69,8 @@ import { buildPendingMarker, buildReplacedMarker } from "../lib/marker.ts";
 import {
 	recordQuarantine,
 	releaseQuarantine,
-	evictExpiredQuarantines,
 	buildQuarantineNotice,
 	buildQuarantineMissedNotice,
-	clearQuarantines,
 } from "../lib/quarantine.ts";
 import {
 	createSteeringState,
@@ -217,9 +218,9 @@ export default function toolclip(api: ExtensionAPI): void {
 		}
 
 		// Quarantine gate: above the (much higher) quarantine threshold the
-		// content is withheld entirely — swapped for a notice, payload held for
-		// one turn. No pending entry is recorded: there is nothing in context
-		// to replace.
+		// content is withheld entirely — swapped for a notice, payload held
+		// until read. No pending entry is recorded: there is nothing in
+		// context to replace.
 		if (
 			config.quarantine &&
 			tokens > config.quarantineThresholdTokens
@@ -414,11 +415,11 @@ export default function toolclip(api: ExtensionAPI): void {
 	// -----------------------------------------------------------------------
 	// 2b. read_quarantined_result tool registration
 	//
-	//    Single-turn escape hatch for a quarantined payload. Honored only
-	//    while the payload is held (the turn right after the quarantine); a
-	//    read releases the payload — subsequent reads for the id are denied.
-	//    The description deliberately stresses the cost (full payload back
-	//    into context) and the preferred alternative (narrow the call).
+	//    Escape hatch for a quarantined payload. Honored while the payload
+	//    is held — which is the rest of the session, not one turn: a read
+	//    releases the payload; subsequent reads for the id are denied. The
+	//    description deliberately stresses the cost (full payload back into
+	//    context) and the preferred alternative (narrow the call).
 	// -----------------------------------------------------------------------
 	api.registerTool({
 		name: "read_quarantined_result",
@@ -426,19 +427,16 @@ export default function toolclip(api: ExtensionAPI): void {
 		description:
 			"Retrieve the full payload of a tool result that was quarantined as too large. " +
 			"Know the trade-off before you call: the entire payload re-enters your context at full " +
-			"token cost, and you can only do this in the response immediately after the " +
-			"[tool-result-quarantined: ...] notice — the data is freed right after that response, " +
-			"and later calls for the id are denied. If you need only part of the data, prefer " +
-			"re-issuing a narrower version of the original tool call instead of reading. If you " +
-			"need the whole payload, read it here once — do NOT reconstruct it piecemeal with " +
-			"several narrowed calls; that costs more than one full read.",
+			"token cost. If you need only part of the data, prefer re-issuing a narrower version of " +
+			"the original tool call instead of reading. If you need the whole payload, read it here " +
+			"once — do NOT reconstruct it piecemeal with several narrowed calls; that costs more " +
+			"than one full read. The read releases the held copy: a second read of the same id is denied.",
 		promptSnippet:
 			"`read_quarantined_result({ toolCallId })` returns a tool result that was withheld " +
-			"as too large. Call it only in your immediately next response, and only when the full " +
-			"payload is truly needed — the quarantine is freed afterwards and the call is then " +
-			"denied. When you do need it all, read it in one call rather than fetching the " +
-			"content in pieces; prefer narrowing the original tool call only when part of the " +
-			"data suffices.",
+			"as too large. Call it only when the full payload is truly needed — the read frees the " +
+			"held copy, so a second read of the same id is denied. When you do need it all, read it " +
+			"in one call rather than fetching the content in pieces; prefer narrowing the original " +
+			"tool call only when part of the data suffices.",
 		parameters: Type.Object({
 			toolCallId: Type.String({
 				description:
@@ -461,7 +459,7 @@ export default function toolclip(api: ExtensionAPI): void {
 							text: buildQuarantineMissedNotice(params.toolCallId),
 						},
 					],
-					details: { ok: false, reason: "not held (already read, or window expired)" },
+					details: { ok: false, reason: "not held (already read)" },
 				};
 			}
 			return {
@@ -478,14 +476,12 @@ export default function toolclip(api: ExtensionAPI): void {
 	api.on("before_agent_start", (event: BeforeAgentStartEvent) => {
 		// New round: reset the steering latches so a pending pile persisting
 		// into this round is re-announced at that round's first turn boundary, and
-		// restart the per-round re-read counter.
+		// restart the per-round re-read counter. Held quarantines are NOT cleared:
+		// payloads are held for the session's lifetime ("held until read; freed
+		// after reading") — the session file holds only the notice, so clearing
+		// here would be data destruction with no replacement.
 		resetSteering(steering);
 		resetRereads(state.readsThisRound);
-
-		// Defensive: a held payload never survives a round boundary. Live
-		// quarantines are already evicted by the turn_end that closes their
-		// one-turn window — this covers aborted runs that never reached it.
-		clearQuarantines(state);
 		const toolclipInstructions =
 			"\n## Tool Result Replacement\n" +
 			"When a long tool result has a [tool-result-pending-replacement: ...] marker, " +
@@ -532,13 +528,12 @@ export default function toolclip(api: ExtensionAPI): void {
 			"\n## Quarantined Tool Results\n" +
 			`A tool result above ${config.quarantineThresholdTokens} tokens is not shown to you at all: ` +
 			"its content is replaced by a [tool-result-quarantined: ...] notice and the full payload is " +
-			"held for exactly one response.\n" +
+			"held until you read it.\n" +
 			"- First choice: never read it. Re-issue the tool call with a narrower scope (specific " +
 			"  file, tighter pattern, smaller range) so the result comes back small enough to use.\n" +
 			"- Only when the full payload is genuinely required, call " +
-			"  `read_quarantined_result({ toolCallId: \"...\" })` in your immediately next response. That " +
-			"  is the only window: once that response ends, the payload is freed and read attempts for " +
-			"  it are denied.\n" +
+			"  `read_quarantined_result({ toolCallId: \"...\" })`. The read frees the held copy — a " +
+			"  second read of the same id is denied.\n" +
 			"- If you need the whole payload, read it from the quarantine — do NOT reconstruct it " +
 			"  piecemeal (e.g. reading a large file in offset/limit chunks, or re-running the call " +
 			"  several times with narrower scopes). Several partial fetches cost more calls and more " +
@@ -585,17 +580,14 @@ export default function toolclip(api: ExtensionAPI): void {
 	});
 
 	// -----------------------------------------------------------------------
-	// 5. turn_start / turn_end — quarantine bookkeeping + steering delivery.
+	// 5. turn_start / turn_end — steering delivery.
 	//
-	//    pi delivers a turn's tool results at that turn's turn_end, so the
-	//    LLM first sees a quarantine notice when it generates the NEXT turn
-	//    (`createdTurn + 1`). That next turn is the only read window; reads
-	//    execute during it, before its turn_end. Eviction at turn_end with
-	//    `createdTurn <= turnIndex - 1` therefore frees still-unread payloads
-	//    exactly when their one-turn window closes, without ever evicting a
-	//    payload that could not yet have been read.
+	//    Quarantine bookkeeping needs no turn events anymore: payloads are
+	//    held for the session's lifetime (see lib/quarantine.ts) — the former
+	//    eviction-at-turn_end is gone (it destroyed unread payloads whose
+	//    read-window turn had been consumed by the steering nag).
 	//
-	//    turn_end is also the steering observation point. pi's agent loop
+	//    turn_end is the steering observation point. pi's agent loop
 	//    polls the steering queue immediately after turn_end, so a steer
 	//    enqueued in this handler is delivered at this same boundary: the
 	//    reminder becomes a persisted user message, visible from the very
@@ -606,8 +598,6 @@ export default function toolclip(api: ExtensionAPI): void {
 	});
 
 	api.on("turn_end", (event: TurnEndEvent) => {
-		evictExpiredQuarantines(state, event.turnIndex);
-
 		// Steering reminder: count + size triggers, observed at the turn
 		// boundary — after this turn's tool results are in (new pending marks
 		// and replacements recorded), so the snapshot is the freshest the
