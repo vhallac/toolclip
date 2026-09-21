@@ -10,7 +10,8 @@
  *      and no eviction; the read's own result re-enters the normal
  *      pending-marker path (replaceable, never re-quarantined).
  *   3. After a read releases the payload, later reads for the id are
- *      denied.
+ *      denied as "already read"; reads for never-quarantined ids are
+ *      denied as "never held" (pointing at the pending-marker path).
  *   4. Held payloads survive round boundaries.
  */
 
@@ -142,11 +143,11 @@ describe("toolclip quarantine — read/release cycle (session-lifetime hold)", (
 			message: { role: "assistant", content: [] },
 			toolResults: [],
 		});
-		// A late second read for the original id is denied.
+		// A late second read for the original id is denied as already-read.
 		const late = (await invokeTool(tools, "read_quarantined_result", "read-2", {
 			toolCallId: "bash-1",
 		})) as { details: Record<string, unknown>; content: Array<{ type: string; text: string }> };
-		expect(late.details).toMatchObject({ ok: false });
+		expect(late.details).toMatchObject({ ok: false, reason: "already-read" });
 		expect(late.content[0].text).toContain("already read");
 	});
 
@@ -230,6 +231,25 @@ describe("toolclip quarantine — read/release cycle (session-lifetime hold)", (
 		})) as { content: Array<{ type: string; text: string }>; details: Record<string, unknown> };
 		expect(read.details).toMatchObject({ ok: true, toolCallId: "bash-1", tokens: 64276 });
 		expect(read.content[0].text).toBe(QUAR_TEXT);
+	});
+
+	it("a read for a pending-marked (never quarantined) id is denied as never-held, pointing at distillation", async () => {
+		const { handlers, tools, pi } = createMockApi();
+		toolclip(pi as never);
+		invokeHandler(handlers, "turn_start", { type: "turn_start", turnIndex: 0, timestamp: 0 });
+
+		// A pending-marked result — the observed confusion: the model mistakes
+		// the pending marker for a quarantine notice and tries to "read" it.
+		invokeHandler(handlers, "tool_result", toolResultEvent("bash-1", PEND_TEXT));
+		const read = (await invokeTool(tools, "read_quarantined_result", "read-1", {
+			toolCallId: "bash-1",
+		})) as { content: Array<{ type: string; text: string }>; details: Record<string, unknown> };
+
+		expect(read.details).toMatchObject({ ok: false, reason: "never-held" });
+		expect(read.content[0].text).toContain("[quarantine-missed: toolCallId=bash-1]");
+		expect(read.content[0].text).toContain("never quarantined");
+		expect(read.content[0].text).toContain("distill it with replace_tool_result");
+		expect(read.content[0].text).not.toContain(PEND_TEXT);
 	});
 });
 

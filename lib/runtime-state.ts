@@ -23,6 +23,7 @@ export function createRuntimeState(): ToolclipRuntimeState {
 	return {
 		entries: new Map(),
 		quarantines: new Map(),
+		releasedQuarantines: new Set(),
 		currentTurn: 0,
 		readsThisRound: new Map(),
 	};

@@ -72,6 +72,7 @@ import {
 	buildQuarantineNotice,
 	buildQuarantineMissedNotice,
 } from "../lib/quarantine.ts";
+import type { QuarantineMissReason } from "../lib/quarantine.ts";
 import {
 	createSteeringState,
 	resetSteering,
@@ -417,9 +418,13 @@ export default function toolclip(api: ExtensionAPI): void {
 	//
 	//    Escape hatch for a quarantined payload. Honored while the payload
 	//    is held — which is the rest of the session, not one turn: a read
-	//    releases the payload; subsequent reads for the id are denied. The
-	//    description deliberately stresses the cost (full payload back into
-	//    context) and the preferred alternative (narrow the call).
+	//    releases the payload; subsequent reads for the id are denied with
+	//    "already read". A read for an id that was never quarantined is
+	//    denied with "never held" plus a pointer to the pending-marker
+	//    distillation path (the observed confusion: the model called the
+	//    read tool on a pending-marked result). The description deliberately
+	//    stresses the cost (full payload back into context) and the preferred
+	//    alternative (narrow the call).
 	// -----------------------------------------------------------------------
 	api.registerTool({
 		name: "read_quarantined_result",
@@ -452,14 +457,17 @@ export default function toolclip(api: ExtensionAPI): void {
 		): Promise<AgentToolResult<unknown>> {
 			const entry = releaseQuarantine(state, params.toolCallId);
 			if (!entry) {
+				const reason: QuarantineMissReason = state.releasedQuarantines.has(params.toolCallId)
+					? "already-read"
+					: "never-held";
 				return {
 					content: [
 						{
 							type: "text" as const,
-							text: buildQuarantineMissedNotice(params.toolCallId),
+							text: buildQuarantineMissedNotice(params.toolCallId, reason),
 						},
 					],
-					details: { ok: false, reason: "not held (already read)" },
+					details: { ok: false, reason },
 				};
 			}
 			return {

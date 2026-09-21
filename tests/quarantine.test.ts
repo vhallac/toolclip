@@ -4,8 +4,9 @@
  * Anchored on the "held until read; freed after reading" contract:
  *   - A payload is held from quarantine until a read releases it; there is
  *     no eviction and no expiry — a read is honored at any later turn.
- *   - A release destroys the payload; a second read for the same id is
- *     denied.
+ *   - A release destroys the payload and remembers the id as released, so
+ *     a later read attempt can be denied as "already read" (distinct from
+ *     "never held").
  */
 
 import { describe, expect, it } from "vitest";
@@ -30,9 +31,19 @@ describe("quarantine store", () => {
 		expect(quarantineIds(state)).toEqual([]);
 	});
 
-	it("returns undefined when releasing an id that is not held", () => {
+	it("release marks the id as released (for the already-read denial)", () => {
+		const state = createRuntimeState();
+		recordQuarantine(state, "bash-1", "payload", 12000, 0);
+		expect(state.releasedQuarantines.has("bash-1")).toBe(false);
+
+		releaseQuarantine(state, "bash-1");
+		expect(state.releasedQuarantines.has("bash-1")).toBe(true);
+	});
+
+	it("returns undefined when releasing an id that is not held — and does not mark it released", () => {
 		const state = createRuntimeState();
 		expect(releaseQuarantine(state, "nope")).toBeUndefined();
+		expect(state.releasedQuarantines.has("nope")).toBe(false);
 	});
 
 	it("denies a second read for an id that was already released", () => {
@@ -83,11 +94,19 @@ describe("quarantine notices", () => {
 		expect(notice).toContain("more calls and more tokens than one full read");
 	});
 
-	it("the missed denial says the payload was read and points to a narrower re-run", () => {
-		const notice = buildQuarantineMissedNotice("abc-1");
+	it("the already-read denial says the payload was read and points to a narrower re-run", () => {
+		const notice = buildQuarantineMissedNotice("abc-1", "already-read");
 		expect(notice).toContain("[quarantine-missed: toolCallId=abc-1]");
 		expect(notice).toContain("already read");
 		expect(notice).toContain("no longer retrievable");
 		expect(notice).toContain("narrower scope");
+	});
+
+	it("the never-held denial points at the pending-marker distillation path", () => {
+		const notice = buildQuarantineMissedNotice("abc-1", "never-held");
+		expect(notice).toContain("[quarantine-missed: toolCallId=abc-1]");
+		expect(notice).toContain("never quarantined");
+		expect(notice).toContain("[tool-result-pending-replacement: ...] marker");
+		expect(notice).toContain("distill it with replace_tool_result");
 	});
 });

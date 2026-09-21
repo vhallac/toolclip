@@ -71,7 +71,7 @@ export function buildQuarantinedMarker(toolCallId: string, tokens: number): stri
 /**
  * Build the quarantine-missed marker, returned to the LLM when a
  * `read_quarantined_result` call targets an id that is not held (already
- * read and released).
+ * read and released, or never quarantined).
  *
  * @param toolCallId - The id that was requested.
  * @returns The marker string, e.g.

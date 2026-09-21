@@ -107,6 +107,11 @@ export interface QuarantineEntry {
  *
  * `entries` tracks replaceable tool results (keyed by tool-call id).
  * `quarantines` tracks held payloads awaiting a read (session lifetime).
+ * `releasedQuarantines` remembers ids whose payloads were already read
+ * (released), so a denied read attempt can say "already read" instead of
+ * "never held" — the latter usually means the model mistook a pending
+ * marker for a quarantine notice, and the denial then points it at the
+ * distillation path instead.
  * `currentTurn` mirrors pi's turn index, maintained via `turn_start`.
  * `readsThisRound` counts successful read results per path within the
  * current round (re-read observation; reset at each round boundary).
@@ -114,6 +119,7 @@ export interface QuarantineEntry {
 export interface ToolclipRuntimeState {
 	entries: Map<string, ToolclipRuntimeStateEntry>;
 	quarantines: Map<string, QuarantineEntry>;
+	releasedQuarantines: Set<string>;
 	currentTurn: number;
 	readsThisRound: Map<string, number>;
 }
