@@ -43,6 +43,18 @@
  * diagnostic: LLM-facing content and cache behavior are untouched, and
  * re-reads that are not consecutive are still flagged (per-round count).
  *
+ * Expiry: a pending result older than the point where replacing it still
+ * pays back is "expired" — replacing it would rewrite more cached suffix
+ * than it saves. At each `turn_end` (when the turn's usage is readable) the
+ * extension updates measured price estimates (rho/w, EMA over the usage
+ * costs), counts newly eligible entries into `pileTotal`, compacts entries
+ * whose results left the messages, and evaluates the per-entry pay-back
+ * test: expired entries are deleted from the tracker, dropped from the nag,
+ * and a replace call naming one is silently ignored ({ok: true, ignored:
+ * "expired"} — never an error). Expired originals stay in context; nothing
+ * is swapped. Expiry never modifies `pileTotal` (the steering ladder's
+ * total) and is monotone. See lib/expiry.ts for the derivation.
+ *
  * The `context` event does the actual swap before each LLM call.
  *
  * The LLM is the only actor. There is no auto-summarizer and no auto-eviction.
@@ -76,10 +88,19 @@ import type { QuarantineMissReason } from "../lib/quarantine.ts";
 import {
 	createSteeringState,
 	resetSteering,
-	pendingSummary,
 	observePendingSteering,
 	buildSteeringMessage,
 } from "../lib/steering.ts";
+import {
+	observeTurnUsage,
+	countNewlyEligible,
+	compactTracked,
+	resetPileTotalAfterStores,
+	observeReplacement,
+	evaluateExpiry,
+	trackedSummary,
+} from "../lib/expiry.ts";
+import type { TurnUsage } from "../lib/expiry.ts";
 import {
 	recordContextToolCallIds,
 	recordPending,
@@ -156,9 +177,58 @@ function withRereadDetails(
 	return { ...baseObj, ...reread };
 }
 
+/**
+ * Extract the turn's usage observation from the turn_end event's assistant
+ * message (verified against the pi types: `TurnEndEvent.message` is the
+ * turn's `AgentMessage`; for a completed turn it is the assistant message,
+ * whose `usage` is `{input, output, cacheRead, cacheWrite, totalTokens,
+ * cost: {input, output, cacheRead, cacheWrite, total}}`).
+ *
+ * Returns null — meaning "skip the expiry evaluation for this turn and
+ * change nothing" — when the message is not an assistant message, when
+ * usage is missing, or when the context components are not finite
+ * non-negative numbers. An all-zero usage (pi zeroes usage on errored
+ * turns) yields ctx_t of 0, which is no usable request size either — also
+ * null. Garbage `cost` fields are NOT null-worthy: they only discard the
+ * price observation inside `observeTurnUsage`.
+ */
+function extractTurnUsage(event: TurnEndEvent): TurnUsage | null {
+	const message = event.message as { role?: string; usage?: unknown } | undefined;
+	if (!message || message.role !== "assistant") {
+		return null;
+	}
+	const usage = message.usage as
+		| { input?: unknown; output?: unknown; cacheRead?: unknown; cacheWrite?: unknown; cost?: TurnUsage["cost"] }
+		| undefined;
+	if (!usage || typeof usage !== "object") {
+		return null;
+	}
+	const { input, output, cacheRead, cacheWrite } = usage;
+	for (const value of [input, cacheRead, cacheWrite]) {
+		if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+			return null;
+		}
+	}
+	const ctxT = (input as number) + (cacheRead as number) + (cacheWrite as number);
+	if (ctxT <= 0) {
+		return null;
+	}
+	return {
+		ctxT,
+		input: input as number,
+		output: typeof output === "number" ? output : 0,
+		cacheRead: cacheRead as number,
+		cacheWrite: cacheWrite as number,
+		...(usage.cost ? { cost: usage.cost } : {}),
+	};
+}
+
 export default function toolclip(api: ExtensionAPI): void {
 	const config = loadToolclipConfig();
-	const state: ToolclipRuntimeState = createRuntimeState();
+	const state: ToolclipRuntimeState = createRuntimeState({
+		rho: config.expiryRho,
+		writeRatio: config.expiryWriteRatio,
+	});
 	const steering = createSteeringState();
 
 	// -----------------------------------------------------------------------
@@ -279,12 +349,25 @@ export default function toolclip(api: ExtensionAPI): void {
 		toolCallId: string;
 		ok: boolean;
 		reason?: string;
+		ignored?: string;
 		originalTokens?: number;
 		replacementTokens?: number;
 		grew?: boolean;
 	}
 
 	function applyOne(pair: ReplacePair): PairResult {
+		// Expired ids are silently ignored — never an error, never a "grew":
+		// the entry was deleted from the tracker because replacing it no
+		// longer pays back (the original stays in context). The model may
+		// name one while working from an older nag's id list; a failure here
+		// would only push it to retry.
+		if (state.expiredIds.has(pair.toolCallId)) {
+			return {
+				toolCallId: pair.toolCallId,
+				ok: true,
+				ignored: "expired",
+			};
+		}
 		const entry = state.entries.get(pair.toolCallId);
 		if (!entry) {
 			return {
@@ -299,6 +382,7 @@ export default function toolclip(api: ExtensionAPI): void {
 		// target. If we see `grew: true` in real runs, that is the signal to
 		// reintroduce a length gate.
 		recordReplacement(state, pair.toolCallId, pair.replacement, replacementTokens);
+		observeReplacement(state, replacementTokens);
 		return {
 			toolCallId: pair.toolCallId,
 			ok: true,
@@ -309,7 +393,16 @@ export default function toolclip(api: ExtensionAPI): void {
 	}
 
 	function summarizeResults(results: PairResult[]): string {
-		const stored = results.filter((r) => r.ok);
+		// The text lists only actually-stored items; expired ids appear in
+		// neither the Stored nor the Skipped-unknown lines (they remain in
+		// details.results for analysis).
+		const stored = results.filter((r) => r.ok && r.ignored === undefined);
+		const failed = results.filter((r) => !r.ok);
+		if (stored.length === 0 && failed.length === 0) {
+			// Everything was expired (or the batch was somehow empty): nothing
+			// to list, nothing to skip — one flat line, no error.
+			return "Nothing to replace.";
+		}
 		const lines: string[] = [];
 		if (stored.length > 0) {
 			lines.push(
@@ -323,7 +416,6 @@ export default function toolclip(api: ExtensionAPI): void {
 				);
 			}
 		}
-		const failed = results.filter((r) => !r.ok);
 		if (failed.length > 0) {
 			lines.push(
 				`Skipped ${failed.length} unknown id${failed.length === 1 ? "" : "s"}: ` +
@@ -405,6 +497,13 @@ export default function toolclip(api: ExtensionAPI): void {
 			}
 
 			const results = pairs.map(applyOne);
+			// A call that stored at least one replacement resets pileTotal to the
+			// sum over the remaining tracked entries (the stored originals left
+			// the pile). A call that stored nothing — all ids expired or unknown
+			// — must NOT reset: the total stays until a real reset.
+			if (results.some((r) => r.ok && r.ignored === undefined)) {
+				resetPileTotalAfterStores(state);
+			}
 			return {
 				content: [
 					{ type: "text" as const, text: summarizeResults(results) },
@@ -605,51 +704,86 @@ export default function toolclip(api: ExtensionAPI): void {
 	});
 
 	// -----------------------------------------------------------------------
-	// 5. turn_start / turn_end — steering delivery.
+	// 5. turn_start / turn_end — expiry evaluation and steering delivery.
 	//
 	//    Quarantine bookkeeping needs no turn events anymore: payloads are
 	//    held for the session's lifetime (see lib/quarantine.ts) — the former
 	//    eviction-at-turn_end is gone (it destroyed unread payloads whose
 	//    read-window turn had been consumed by the steering nag).
 	//
-	//    turn_end is the steering observation point. pi's agent loop
-	//    polls the steering queue immediately after turn_end, so a steer
-	//    enqueued in this handler is delivered at this same boundary: the
-	//    reminder becomes a persisted user message, visible from the very
-	//    next LLM call onward (see lib/steering.ts for the full mechanism).
+	//    turn_end is the expiry observation point and the steering
+	//    observation point. pi's agent loop polls the steering queue
+	//    immediately after turn_end, so a steer enqueued in this handler is
+	//    delivered at this same boundary: the reminder becomes a persisted
+	//    user message, visible from the very next LLM call onward (see
+	//    lib/steering.ts for the full mechanism).
+	//
+	//    Expiry order (see lib/expiry.ts):
+	//      1. read usage; update turnsSeen, lastCtx, rho, w, noCacheStreak
+	//      2. count newly eligible entries; compact (compaction deletes
+	//         counted-pending entries that left the messages)
+	//      3. evaluate expiry over tracked entries (deletes them, never
+	//         touches pileTotal)
+	//      4. run the ladder on pileTotal; on a fire, build the nag from the
+	//         live tracked entries only
+	//    A turn without usable usage skips steps 1-3 and changes nothing —
+	//    the ladder still runs on the unchanged total.
 	// -----------------------------------------------------------------------
 	api.on("turn_start", (event: TurnStartEvent) => {
 		state.currentTurn = event.turnIndex;
 	});
 
 	api.on("turn_end", (event: TurnEndEvent) => {
-		// Steering reminder: the Fibonacci ladder on the eligible pending
-		// mass, observed at the turn boundary — after this turn's tool
-		// results are in (new pending marks and replacements recorded), so
-		// the snapshot is the freshest the boundary can see. Eligibility
-		// comes from the id set the last `context` event recorded: entries
-		// marked this turn are not yet in it (the model has not had a
-		// response to act on them), and entries compacted away have left
-		// it. When the mass crosses to a higher rung than already announced,
-		// ONE nag fires (even across several rungs at once) and the ratchet
-		// level catches up; when the mass falls below an announced rung,
-		// the level re-arms down. On a fire, the reminder is enqueued via
-		// pi's native steering (`deliverAs: "steer"`): it is persisted as a
-		// real user message at the next turn boundary and stays part of
-		// the session's messages — visible in every subsequent LLM call,
-		// and in compaction/summarization — until the pile is distilled.
-		// `sendUserMessage` is fire-and-forget (pi catches and surfaces
-		// errors internally).
-		const pending = pendingSummary(state);
-		const decision = observePendingSteering(steering, pending.totalTokens, {
+		const usage = extractTurnUsage(event);
+		if (usage) {
+			// Step 1: measured prices, streaks, turn counter.
+			observeTurnUsage(state, usage);
+			// Step 2: eligibility counting + compaction (pileTotal maintenance).
+			countNewlyEligible(state, usage.ctxT);
+			compactTracked(state);
+			// Step 3: expiry — deletes stale tracked entries, never touches
+			// pileTotal. Gated by the master switch (false: ladder-only).
+			if (config.expiry) {
+				evaluateExpiry(state, usage.ctxT, {
+					replacementTokens: config.expiryReplacementTokens,
+					copies: config.expiryReplacementCopies,
+					overheadTokens: config.expiryOverheadTokens,
+					horizonMinTurns: config.expiryHorizonMinTurns,
+					horizonMaxTurns: config.expiryHorizonMaxTurns,
+				});
+			}
+		}
+
+		// Step 4: the Fibonacci ladder on pileTotal (unchanged ratchet
+		// semantics), observed at the turn boundary — after this turn's tool
+		// results are in (new pending marks and replacements recorded), so the
+		// snapshot is the freshest the boundary can see. When the total crosses
+		// to a higher rung than already announced, ONE nag fires (even across
+		// several rungs at once) and the ratchet level catches up; when the
+		// total falls below an announced rung, the level re-arms down. The nag
+		// is built from the LIVE tracked entries (not pileTotal, which may
+		// still carry expired mass until its next reset). If the ladder fires
+		// but no live entries remain, nothing is sent — the level still
+		// advances. On a fire with expired-unannounced ids (announce on), one
+		// trailing line lists them and they are cleared; with no live entries
+		// nothing is sent and they stay queued for the next nag.
+		const live = trackedSummary(state);
+		const decision = observePendingSteering(steering, state.pileTotal, {
 			firstRungTokens: config.steeringFirstRungTokens,
 			enabled: config.steeringReminder,
 		});
-		if (decision.fire) {
+		if (decision.fire && live.items.length > 0) {
+			const expiredLine =
+				config.expiryAnnounce && state.expiredUnannounced.size > 0
+					? [...state.expiredUnannounced]
+					: undefined;
 			api.sendUserMessage(
-				buildSteeringMessage(pending.items.length, pending.totalTokens, pending.items),
+				buildSteeringMessage(live.items.length, live.totalTokens, live.items, expiredLine),
 				{ deliverAs: "steer" },
 			);
+			if (expiredLine) {
+				state.expiredUnannounced.clear();
+			}
 		}
 	});
 }

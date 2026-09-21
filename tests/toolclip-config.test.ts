@@ -9,6 +9,15 @@ describe("loadToolclipConfig", () => {
 			steeringFirstRungTokens: 5000,
 			quarantine: true,
 			quarantineThresholdTokens: 10000,
+			expiry: true,
+			expiryRho: 0.2,
+			expiryWriteRatio: 1.0,
+			expiryReplacementTokens: 170,
+			expiryReplacementCopies: 2,
+			expiryOverheadTokens: 60,
+			expiryHorizonMinTurns: 10,
+			expiryHorizonMaxTurns: 100,
+			expiryAnnounce: true,
 		});
 	});
 
@@ -83,6 +92,70 @@ describe("loadToolclipConfig", () => {
 			steeringFirstRungTokens: 5000,
 			quarantine: true,
 			quarantineThresholdTokens: 10000,
+			expiry: true,
+			expiryRho: 0.2,
+			expiryWriteRatio: 1.0,
+			expiryReplacementTokens: 170,
+			expiryReplacementCopies: 2,
+			expiryOverheadTokens: 60,
+			expiryHorizonMinTurns: 10,
+			expiryHorizonMaxTurns: 100,
+			expiryAnnounce: true,
 		});
+	});
+
+	it("overrides the expiry priors and knobs via env", () => {
+		const config = loadToolclipConfig({
+			TOOLCLIP_EXPIRY_RHO: "0.1",
+			TOOLCLIP_EXPIRY_WRITE_RATIO: "1.25",
+			TOOLCLIP_EXPIRY_REPLACEMENT_TOKENS: "300",
+			TOOLCLIP_EXPIRY_REPLACEMENT_COPIES: "1",
+			TOOLCLIP_EXPIRY_OVERHEAD_TOKENS: "80",
+			TOOLCLIP_EXPIRY_HORIZON_MIN_TURNS: "5",
+			TOOLCLIP_EXPIRY_HORIZON_MAX_TURNS: "50",
+		} as NodeJS.ProcessEnv);
+
+		expect(config.expiryRho).toBe(0.1);
+		expect(config.expiryWriteRatio).toBe(1.25);
+		expect(config.expiryReplacementTokens).toBe(300);
+		expect(config.expiryReplacementCopies).toBe(1);
+		expect(config.expiryOverheadTokens).toBe(80);
+		expect(config.expiryHorizonMinTurns).toBe(5);
+		expect(config.expiryHorizonMaxTurns).toBe(50);
+	});
+
+	it("falls back to the expiry priors for negative or non-numeric values", () => {
+		const config = loadToolclipConfig({
+			TOOLCLIP_EXPIRY_RHO: "-0.5",
+			TOOLCLIP_EXPIRY_WRITE_RATIO: "abc",
+		} as NodeJS.ProcessEnv);
+		expect(config.expiryRho).toBe(0.2);
+		expect(config.expiryWriteRatio).toBe(1.0);
+	});
+
+	it("falls back to the expiry knobs for non-positive or non-integer values", () => {
+		const config = loadToolclipConfig({
+			TOOLCLIP_EXPIRY_REPLACEMENT_TOKENS: "0",
+			TOOLCLIP_EXPIRY_REPLACEMENT_COPIES: "2.5",
+			TOOLCLIP_EXPIRY_OVERHEAD_TOKENS: "-60",
+			TOOLCLIP_EXPIRY_HORIZON_MIN_TURNS: "x",
+			TOOLCLIP_EXPIRY_HORIZON_MAX_TURNS: "",
+		} as NodeJS.ProcessEnv);
+		expect(config.expiryReplacementTokens).toBe(170);
+		expect(config.expiryReplacementCopies).toBe(2);
+		expect(config.expiryOverheadTokens).toBe(60);
+		expect(config.expiryHorizonMinTurns).toBe(10);
+		expect(config.expiryHorizonMaxTurns).toBe(100);
+	});
+
+	it("disables expiry via TOOLCLIP_EXPIRY=false (ladder-only)", () => {
+		const config = loadToolclipConfig({ TOOLCLIP_EXPIRY: "false" } as NodeJS.ProcessEnv);
+		expect(config.expiry).toBe(false);
+		expect(config.expiryAnnounce).toBe(true); // independent switch
+	});
+
+	it("disables the expired-ids announce via TOOLCLIP_EXPIRY_ANNOUNCE=false", () => {
+		const config = loadToolclipConfig({ TOOLCLIP_EXPIRY_ANNOUNCE: "false" } as NodeJS.ProcessEnv);
+		expect(config.expiryAnnounce).toBe(false);
 	});
 });

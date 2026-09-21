@@ -734,14 +734,35 @@ describe("steering reminder delivery", () => {
 		});
 	}
 
-	// Helper: fire a turn_end — the steering observation point. At a real
-	// turn boundary pi polls the steering queue right after this event, so
-	// whatever the handler enqueues via sendUserMessage is delivered here.
-	function runTurnEnd(handlers: Map<string, Handler[]>, turnIndex = 0): void {
+	// Helper: fire a turn_end — the expiry observation point and the steering
+	// observation point. The assistant message carries the turn's usage
+	// (verified against the pi types: Usage {input, output, cacheRead,
+	// cacheWrite, totalTokens, cost}). The default costs are chosen so the
+	// measured price ratios equal the priors exactly (cacheRead ratio 0.2,
+	// write ratio 1.0): rho/w stay at 0.2/1.0 and phi = 0.25, so expiry
+	// thresholds in tests follow the spec's worked examples. Pass a custom
+	// usage to grow the context across turns.
+	const BASE_USAGE = {
+		input: 10000,
+		output: 100,
+		cacheRead: 9000,
+		cacheWrite: 1000,
+		totalTokens: 19100,
+		cost: { input: 1.0, output: 0.3, cacheRead: 0.18, cacheWrite: 0.1, total: 1.58 },
+	};
+
+	function runTurnEnd(
+		handlers: Map<string, Handler[]>,
+		turnIndex = 0,
+		usage: Record<string, unknown> | null = BASE_USAGE,
+	): void {
 		invokeHandler(handlers, "turn_end", {
 			type: "turn_end",
 			turnIndex,
-			message: { role: "assistant", content: [] },
+			message:
+				usage === null
+					? { role: "assistant", content: [] }
+					: { role: "assistant", content: [], usage },
 			toolResults: [],
 		});
 	}
@@ -866,22 +887,22 @@ describe("steering reminder delivery", () => {
 		expect(text).not.toContain("- t-1\n");
 	});
 
-	it("entries compacted away stop counting, without deleting their tracker entries", () => {
-		const { handlers, pi, steers } = createMockApi();
+	it("entries compacted away are removed from the tracker and stop counting", async () => {
+		const { handlers, tools, pi, steers } = createMockApi();
 		toolclip(pi as never);
 		for (const id of ["a", "b"]) emitPending(handlers, id);
 		runContext(handlers, ["a", "b"]);
 		runTurnEnd(handlers);
 		expect(steers).toHaveLength(1); // 11,552 tokens: crossed 2, level 2
 
-		// "b" is compacted away: it is no longer in the messages, so it
-		// stops counting (its tracker entry stays — nothing is deleted).
+		// "b" is compacted away: it is no longer in the messages, so its
+		// tracker entry is removed and it stops counting.
 		runContext(handlers, ["a"]);
 		runTurnEnd(handlers);
 		expect(steers).toHaveLength(1); // 5,776: crossed 1 < 2 — re-armed, no nag
 
 		// Re-grown pile: a + fresh c = 11,552 — crossed 2 > 1 — fires again,
-		// and the nag lists only the eligible ids.
+		// and the nag lists only the live tracked ids.
 		emitPending(handlers, "c");
 		runContext(handlers, ["a", "c"]);
 		runTurnEnd(handlers);
@@ -891,6 +912,18 @@ describe("steering reminder delivery", () => {
 		expect(text).toContain("- a (~5776 tokens)");
 		expect(text).toContain("- c (~5776 tokens)");
 		expect(text).not.toContain("- b");
+
+		// The compacted entry is gone from the tracker: a replace call naming
+		// it is an unknown id (there is nothing in context to swap anyway).
+		const result = (await invokeTool(tools, "replace_tool_result", "llm-2", {
+			items: [
+				{ toolCallId: "b", replacement: "too late" },
+				{ toolCallId: "a", replacement: "still here" },
+			],
+		})) as { details: Record<string, unknown> };
+		const results = result.details.results as Array<Record<string, unknown>>;
+		expect(results[0]).toMatchObject({ toolCallId: "b", ok: false, reason: "unknown id" });
+		expect(results[1]).toMatchObject({ toolCallId: "a", ok: true });
 	});
 
 	it("does not steer when all pending results have been replaced", async () => {
@@ -994,6 +1027,274 @@ describe("steering reminder delivery", () => {
 // -----------------------------------------------------------------------
 // before_agent_start event handler tests
 // -----------------------------------------------------------------------
+
+// -----------------------------------------------------------------------
+// expiry tests (turn_end steps 1-3; ladder interplay in step 4)
+// -----------------------------------------------------------------------
+describe("expiry of stale pending replacements", () => {
+	const LONG = "x".repeat(9000); // 5776 tokens estimated — above the 1000-token threshold
+
+	afterEach(() => {
+		vi.unstubAllEnvs();
+	});
+
+	function emitPending(handlers: Map<string, Handler[]>, toolCallId: string): void {
+		invokeHandler(handlers, "tool_result", {
+			type: "tool_result",
+			toolCallId,
+			toolName: "bash",
+			content: [{ type: "text", text: LONG }],
+			isError: false,
+		});
+	}
+
+	function runContext(handlers: Map<string, Handler[]>, ids: string[]): void {
+		invokeHandler(handlers, "context", {
+			type: "context",
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "hi" }] },
+				...ids.map((toolCallId) => ({
+					role: "toolResult",
+					toolCallId,
+					toolName: "bash",
+					content: [{ type: "text", text: LONG }],
+					isError: false,
+				})),
+			],
+		});
+	}
+
+	// Usage whose cost ratios equal the priors exactly (cacheRead ratio 0.2,
+	// write ratio 1.0) regardless of the input size, so rho/w stay at
+	// 0.2/1.0 and phi = 0.25: thresholds follow the spec's worked examples.
+	function usageWithCtx(ctxT: number): Record<string, unknown> {
+		const input = ctxT - 10000;
+		return {
+			input,
+			output: 100,
+			cacheRead: 9000,
+			cacheWrite: 1000,
+			totalTokens: ctxT + 100,
+			cost: { input: input * 1e-4, output: 0.3, cacheRead: 0.18, cacheWrite: 0.1, total: 0 },
+		};
+	}
+
+	function runTurnEndCtx(handlers: Map<string, Handler[]>, turnIndex: number, ctxT: number): void {
+		invokeHandler(handlers, "turn_end", {
+			type: "turn_end",
+			turnIndex,
+			message: { role: "assistant", content: [], usage: usageWithCtx(ctxT) },
+			toolResults: [],
+		});
+	}
+
+	it("expires a stale entry and silently ignores a replace call naming it", async () => {
+		const { handlers, pi, tools, steers } = createMockApi();
+		toolclip(pi as never);
+		emitPending(handlers, "old");
+		runContext(handlers, ["old"]);
+
+		// The entry is counted at turn 1 with ctxSeen = 20000. Context then
+		// grows by 1400 tokens per turn (S = 1400*(k-1) <= 13440 = the
+		// pay-back threshold at H = 10: net = 5776 - 2*170 - 60 = 5376, phi =
+		// 0.25), and jumps to 40000 at turn 10: S = 20000 > 13440 → expired.
+		// The pile (5776) crosses rung 1 at the first boundary: one nag, then
+		// silence while the level holds.
+		for (let i = 1; i <= 9; i++) {
+			runTurnEndCtx(handlers, i, 20000 + 1400 * (i - 1));
+		}
+		runTurnEndCtx(handlers, 10, 40000);
+		expect(steers).toHaveLength(1);
+
+		// The expired entry is gone from the tracker: a replace call naming
+		// it is silently ignored — ok, not an error, nothing stored.
+		const result = (await invokeTool(tools, "replace_tool_result", "llm-1", {
+			items: [{ toolCallId: "old", replacement: "too late" }],
+		})) as { content: Array<{ type: string; text: string }>; details: Record<string, unknown> };
+
+		const r0 = (result.details.results as Array<Record<string, unknown>>)[0];
+		expect(r0).toMatchObject({ toolCallId: "old", ok: true, ignored: "expired" });
+		expect(r0.originalTokens).toBeUndefined();
+		expect(r0.grew).toBeUndefined();
+		expect(result.content[0].text).toBe("Nothing to replace.");
+	});
+
+	it("lists newly expired ids once in the next nag, then clears them", () => {
+		const { handlers, pi, steers } = createMockApi();
+		toolclip(pi as never);
+		emitPending(handlers, "old");
+		runContext(handlers, ["old"]);
+		runTurnEndCtx(handlers, 1, 20000);
+		expect(steers).toHaveLength(1);
+		expect((steers[0].content as string)).not.toContain("Expired");
+
+		// Expire "old": S = ctxT - 20000 stays <= 13440 through turn 9, then
+		// jumps past it at turn 10 (ctxT 40000 → S 20000). No new crossing:
+		// pileTotal keeps the expired mass, crossed stays 1 = level.
+		for (let i = 2; i <= 9; i++) {
+			runTurnEndCtx(handlers, i, 20000 + 1400 * (i - 1));
+		}
+		runTurnEndCtx(handlers, 10, 40000);
+		expect(steers).toHaveLength(1);
+
+		// Fresh pending mass crosses rung 2 (pileTotal 11552): the nag fires
+		// with the LIVE total (5776) and one Expired line for "old".
+		emitPending(handlers, "more");
+		runContext(handlers, ["more"]);
+		runTurnEndCtx(handlers, 11, 40000);
+		expect(steers).toHaveLength(2);
+		const text = steers[1].content as string;
+		expect(text).toContain("1 tool-result-pending-replacements");
+		expect(text).toContain("- more (~5776 tokens)");
+		expect(text).toContain("Expired (no longer worth replacing; leave them): old");
+
+		// Announced: cleared. The next boundary (same pile) stays silent.
+		runTurnEndCtx(handlers, 12, 40000);
+		expect(steers).toHaveLength(2);
+	});
+
+	it("expiry never changes the ladder total; the next reset re-arms (worked example 6)", async () => {
+		const { handlers, pi, tools, steers } = createMockApi();
+		toolclip(pi as never);
+		emitPending(handlers, "a");
+		emitPending(handlers, "b");
+		runContext(handlers, ["a", "b"]);
+		runTurnEndCtx(handlers, 1, 20000); // counted at 20000; pileTotal 11552; nag 1
+		expect(steers).toHaveLength(1);
+
+		// Slow growth keeps a, b live through turn 9 (S <= 11200 <= 13440),
+		// then a jump expires them: S = 20000 > 13440. c is marked after the
+		// jump, so it is counted at ctxSeen 40000 and stays live.
+		for (let i = 2; i <= 9; i++) {
+			runTurnEndCtx(handlers, i, 20000 + 1400 * (i - 1));
+		}
+		runTurnEndCtx(handlers, 10, 40000);
+		expect(steers).toHaveLength(1); // pileTotal unchanged → no new crossing
+
+		// The total still carries the expired mass (11552): no nag at the
+		// next boundary either — expiry must not fire or re-arm the ladder.
+		runTurnEndCtx(handlers, 11, 40000);
+		expect(steers).toHaveLength(1);
+
+		// Fresh live entry: counted at the current context; pileTotal rises
+		// to 17328 (11552 expired mass + 5776 live) and crosses rung 4
+		// (21000): one nag with the LIVE total (5776) and the Expired line.
+		emitPending(handlers, "c");
+		runContext(handlers, ["c"]);
+		runTurnEndCtx(handlers, 12, 40000);
+		expect(steers).toHaveLength(2);
+		const nag2 = steers[1].content as string;
+		expect(nag2).toContain("1 tool-result-pending-replacements");
+		expect(nag2).toContain("- c (~5776 tokens)");
+		expect(nag2).toContain("Expired (no longer worth replacing; leave them): a, b");
+
+		// The model replaces the live entry: the storing call resets
+		// pileTotal to the remaining tracked sum (0) and the level re-arms.
+		const repl = (await invokeTool(tools, "replace_tool_result", "llm-1", {
+			items: [{ toolCallId: "c", replacement: "distilled" }],
+		})) as { details: Record<string, unknown> };
+		expect(repl.details).toMatchObject({ ok: true });
+
+		runTurnEndCtx(handlers, 13, 40000); // crossed(0) = 0 < 4 → re-arm, no nag
+		expect(steers).toHaveLength(2);
+
+		// Fresh mass: crossed(5776) = 1 > 0 → nag 3 lists the live entry and
+		// carries no Expired line (a, b were announced at nag 2 and cleared).
+		emitPending(handlers, "d");
+		runContext(handlers, ["d"]);
+		runTurnEndCtx(handlers, 14, 40000);
+		expect(steers).toHaveLength(3);
+		const text = steers[2].content as string;
+		expect(text).toContain("1 tool-result-pending-replacements");
+		expect(text).toContain("- d (~5776 tokens)");
+		expect(text).not.toContain("Expired");
+	});
+
+	it("keeps everything replaceable when TOOLCLIP_EXPIRY is false", async () => {
+		vi.stubEnv("TOOLCLIP_EXPIRY", "false");
+		const { handlers, pi, tools, steers } = createMockApi();
+		toolclip(pi as never);
+		emitPending(handlers, "old");
+		runContext(handlers, ["old"]);
+		for (let i = 1; i <= 10; i++) {
+			runTurnEndCtx(handlers, i, 20000 + 1400 * (i - 1));
+		}
+		runTurnEndCtx(handlers, 11, 40000); // would expire with expiry on
+		// The pile crossed rung 1 once; no expiry, no Expired line anywhere.
+		expect(steers).toHaveLength(1);
+		expect((steers[0].content as string)).not.toContain("Expired");
+
+		const result = (await invokeTool(tools, "replace_tool_result", "llm-1", {
+			items: [{ toolCallId: "old", replacement: "still fine" }],
+		})) as { details: Record<string, unknown> };
+		const r0 = (result.details.results as Array<Record<string, unknown>>)[0];
+		expect(r0).toMatchObject({ toolCallId: "old", ok: true });
+		expect(r0.ignored).toBeUndefined();
+	});
+
+	it("a turn without usable usage changes nothing; the ladder still runs later", async () => {
+		const { handlers, pi, tools, steers } = createMockApi();
+		toolclip(pi as never);
+		emitPending(handlers, "e");
+		runContext(handlers, ["e"]);
+
+		// No usage on the assistant message: skip the expiry evaluation and
+		// change nothing — no counting (pileTotal stays 0), no nag.
+		invokeHandler(handlers, "turn_end", {
+			type: "turn_end",
+			turnIndex: 0,
+			message: { role: "assistant", content: [] },
+			toolResults: [],
+		});
+		expect(steers).toHaveLength(0);
+
+		// The entry is still replaceable.
+		const early = (await invokeTool(tools, "replace_tool_result", "llm-early", {
+			items: [{ toolCallId: "e", replacement: "not counted yet, still replaceable" }],
+		})) as { details: Record<string, unknown> };
+		expect((early.details.results as Array<Record<string, unknown>>)[0]).toMatchObject({ ok: true });
+
+		// And a usable turn counts the (fresh) pile and steers normally.
+		emitPending(handlers, "e2");
+		runContext(handlers, ["e2"]);
+		runTurnEndCtx(handlers, 1, 20000);
+		expect(steers).toHaveLength(1);
+		expect((steers[0].content as string)).toContain("- e2 (~5776 tokens)");
+	});
+
+	it("a mixed batch lists only stored items; expired ids stay in details only", async () => {
+		const { handlers, pi, tools, steers } = createMockApi();
+		toolclip(pi as never);
+		emitPending(handlers, "old");
+		runContext(handlers, ["old"]);
+		for (let i = 1; i <= 9; i++) {
+			runTurnEndCtx(handlers, i, 20000 + 1400 * (i - 1));
+		}
+		runTurnEndCtx(handlers, 10, 40000); // old expires
+		emitPending(handlers, "fresh");
+		runContext(handlers, ["fresh"]);
+		runTurnEndCtx(handlers, 11, 40000); // fresh counted; nag fires (pileTotal 11552)
+		expect(steers).toHaveLength(2);
+
+		const result = (await invokeTool(tools, "replace_tool_result", "llm-1", {
+			items: [
+				{ toolCallId: "old", replacement: "expired, ignored" },
+				{ toolCallId: "fresh", replacement: "stored summary" },
+			],
+		})) as { content: Array<{ type: string; text: string }>; details: Record<string, unknown> };
+
+		const text = result.content[0].text;
+		expect(text).toContain("Stored 1 replacement");
+		expect(text).toContain("- fresh:");
+		expect(text).not.toContain("old");
+		expect(text).not.toContain("Skipped");
+		const results = result.details.results as Array<Record<string, unknown>>;
+		expect(results).toHaveLength(2);
+		expect(results[0]).toMatchObject({ toolCallId: "old", ok: true, ignored: "expired" });
+		expect(results[1]).toMatchObject({ toolCallId: "fresh", ok: true });
+	});
+});
+
 describe("before_agent_start handler", () => {
 	it("appends toolclip instructions to the system prompt", () => {
 		const { handlers, pi } = createMockApi();

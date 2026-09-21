@@ -51,6 +51,60 @@ export interface ToolclipConfig {
 	 * `TOOLCLIP_QUARANTINE_THRESHOLD_TOKENS`.
 	 */
 	quarantineThresholdTokens: number;
+	/**
+	 * Whether stale pending entries are expired (deleted from the tracker
+	 * once replacing them no longer pays back; replace calls naming them
+	 * are silently ignored). When false: no expiry — ladder-only, entries
+	 * are kept until replaced or compacted away. Defaults to `true`. Gated
+	 * by `TOOLCLIP_EXPIRY`.
+	 */
+	expiry: boolean;
+	/**
+	 * Prior for the cache-read price as a ratio of the uncached-input price.
+	 * Replaced by the measured value via EMA once usage costs flow. Defaults
+	 * to `0.2`. Gated by `TOOLCLIP_EXPIRY_RHO`.
+	 */
+	expiryRho: number;
+	/**
+	 * Prior for the cache-write price as a ratio of the uncached-input price
+	 * (1.25 on Anthropic-style pricing). Defaults to `1.0`. Gated by
+	 * `TOOLCLIP_EXPIRY_WRITE_RATIO`.
+	 */
+	expiryWriteRatio: number;
+	/**
+	 * Prior for the assumed replacement size (tokens) until 3 replacements
+	 * have been measured. Defaults to `170`. Gated by
+	 * `TOOLCLIP_EXPIRY_REPLACEMENT_TOKENS`.
+	 */
+	expiryReplacementTokens: number;
+	/**
+	 * How many copies of the replacement text sit in context: 2 while the
+	 * replace call's args are kept (args + swapped result), 1 after a future
+	 * arg stubbing. Defaults to `2`. Gated by
+	 * `TOOLCLIP_EXPIRY_REPLACEMENT_COPIES`.
+	 */
+	expiryReplacementCopies: number;
+	/**
+	 * Fixed tokens per replacement not otherwise counted (call block, ids,
+	 * echo). Defaults to `60`. Gated by `TOOLCLIP_EXPIRY_OVERHEAD_TOKENS`.
+	 */
+	expiryOverheadTokens: number;
+	/**
+	 * Floor of H, the expected remaining turns in the expiry pay-back test.
+	 * Defaults to `10`. Gated by `TOOLCLIP_EXPIRY_HORIZON_MIN_TURNS`.
+	 */
+	expiryHorizonMinTurns: number;
+	/**
+	 * Cap of H, the expected remaining turns in the expiry pay-back test.
+	 * Defaults to `100`. Gated by `TOOLCLIP_EXPIRY_HORIZON_MAX_TURNS`.
+	 */
+	expiryHorizonMaxTurns: number;
+	/**
+	 * Whether newly expired ids are listed once in the next steering nag
+	 * ("Expired (no longer worth replacing; leave them): ..."). Defaults to
+	 * `true`. Gated by `TOOLCLIP_EXPIRY_ANNOUNCE`.
+	 */
+	expiryAnnounce: boolean;
 }
 
 /**
@@ -64,6 +118,14 @@ export interface ToolclipConfig {
  * `grew` is set when a replacement is recorded whose estimated token count is
  * >= the original's — the observation target. No rejection happens; this is
  * purely diagnostic.
+ *
+ * `counted`/`ctxSeen` drive the expiry accounting (see lib/expiry.ts): an
+ * entry becomes COUNTED at the first turn_end where it is pending and its id
+ * is in the most recent context event's id set; at that moment `ctxSeen`
+ * records the request context size (ctx_t) of that turn, so the tokens
+ * appended since (S_i = ctx_t - ctxSeen) can be compared against the
+ * pay-back threshold later. `pileTotal` accumulates the entry's
+ * `originalTokens` at the same moment.
  */
 export interface ToolclipRuntimeStateEntry {
 	originalTokens: number;
@@ -71,6 +133,10 @@ export interface ToolclipRuntimeStateEntry {
 	replacement?: string;
 	replacementTokens?: number;
 	grew?: boolean;
+	/** True once the entry has been counted into `pileTotal`. */
+	counted: boolean;
+	/** Request context size (ctx_t) at the turn_end where the entry was counted. 0 until counted. */
+	ctxSeen: number;
 }
 
 /**
@@ -116,6 +182,25 @@ export interface QuarantineEntry {
  * messages, so they stop counting.
  * `readsThisRound` counts successful read results per path within the
  * current round (re-read observation; reset at each round boundary).
+ *
+ * Expiry accounting (lib/expiry.ts):
+ * `pileTotal` is the steering ladder's total — the sum of originalTokens over
+ * *tracked* entries (pending, counted, not expired). It is maintained by three
+ * resets: entry counting (+= originalTokens), a replace call that stored at
+ * least one replacement (recomputed), and compaction (recomputed when entries
+ * were removed). Expiry itself never modifies it — expired mass stays in the
+ * total until the next reset, so expiry can neither fire nor re-arm the ladder.
+ * `turnsSeen` counts turn_end events since the extension loaded (not reset per
+ * round); `lastCtx` is the request context size of the most recent usable turn.
+ * `rho`/`w` are running price estimates (cache-read / cache-write price as a
+ * ratio of the uncached-input price), EMA-updated from per-turn usage costs;
+ * they start at the config priors. `noCacheStreak` counts consecutive usable
+ * turns with no cache activity (three or more freeze expiry — with no cache
+ * there is no pay-back to model). `replMeanTokens`/`replCount` track the mean
+ * stored replacement size (used as R once 3 replacements are seen).
+ * `expiredIds` remembers expired ids forever (expiry is monotone; a replace
+ * call naming one is silently ignored); `expiredUnannounced` holds ids expired
+ * since the last nag that listed them (capped at 20).
  */
 export interface ToolclipRuntimeState {
 	entries: Map<string, ToolclipRuntimeStateEntry>;
@@ -124,4 +209,24 @@ export interface ToolclipRuntimeState {
 	currentTurn: number;
 	lastContextToolCallIds: Set<string>;
 	readsThisRound: Map<string, number>;
+	/** The steering ladder's total: sum of originalTokens over tracked entries. */
+	pileTotal: number;
+	/** turn_end events observed since the extension loaded (not reset per round). */
+	turnsSeen: number;
+	/** Request context size (input + cacheRead + cacheWrite) of the most recent usable turn. */
+	lastCtx: number;
+	/** Running cache-read price ratio (cacheRead price / uncached input price). */
+	rho: number;
+	/** Running cache-write price ratio (cacheWrite price / uncached input price). */
+	w: number;
+	/** Consecutive usable turns with no cache activity (cacheRead == 0 && cacheWrite == 0). */
+	noCacheStreak: number;
+	/** Running mean of replacementTokens over stored replacements. */
+	replMeanTokens: number;
+	/** How many stored replacements the mean is over. */
+	replCount: number;
+	/** Ids whose pending entries were expired (never re-armed). */
+	expiredIds: Set<string>;
+	/** Ids expired since the last nag that listed them (capped at 20). */
+	expiredUnannounced: Set<string>;
 }

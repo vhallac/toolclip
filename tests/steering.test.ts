@@ -4,7 +4,6 @@ import {
 	createSteeringState,
 	crossedRungs,
 	observePendingSteering,
-	pendingSummary,
 	resetSteering,
 } from "../lib/steering.ts";
 import type { SteeringOptions } from "../lib/steering.ts";
@@ -75,61 +74,6 @@ describe("crossedRungs", () => {
 		// 1_000_000 / 5000 = 200 -> rungs below: 5000, 8000, 13000, 21000,
 		// 34000, 55000, 89000, 144000, 233000, 377000, 610000, 987000.
 		expect(crossedRungs(1_000_000, 5000)).toBe(12);
-	});
-});
-
-describe("pendingSummary — context-event eligibility", () => {
-	it("collects pending entries whose ids are in the last context event", () => {
-		const rt = createRuntimeState();
-		recordPending(rt, "a", 100, LONG);
-		recordPending(rt, "b", 250, LONG);
-		recordContextToolCallIds(rt, ["a", "b"]);
-		const summary = pendingSummary(rt);
-		expect(summary.items).toEqual([
-			{ id: "a", tokens: 100 },
-			{ id: "b", tokens: 250 },
-		]);
-		expect(summary.totalTokens).toBe(350);
-	});
-
-	it("excludes replaced entries even when still in the messages", () => {
-		const rt = createRuntimeState();
-		recordPending(rt, "a", 100, LONG);
-		recordPending(rt, "b", 250, LONG);
-		recordReplacement(rt, "a", "short", 1);
-		recordContextToolCallIds(rt, ["a", "b"]);
-		const summary = pendingSummary(rt);
-		expect(summary.items).toEqual([{ id: "b", tokens: 250 }]);
-		expect(summary.totalTokens).toBe(250);
-	});
-
-	it("excludes entries not in the most recent context event (marked this turn, or compacted away)", () => {
-		const rt = createRuntimeState();
-		recordPending(rt, "seen", 400, LONG);
-		recordPending(rt, "fresh-this-turn", 300, LONG);
-		recordPending(rt, "compacted-away", 200, LONG);
-		// Only "seen" is in the messages the model most recently received.
-		recordContextToolCallIds(rt, ["seen"]);
-		const summary = pendingSummary(rt);
-		expect(summary.items).toEqual([{ id: "seen", tokens: 400 }]);
-		expect(summary.totalTokens).toBe(400);
-	});
-
-	it("tracks only the most recent context event (later events replace the id set)", () => {
-		const rt = createRuntimeState();
-		recordPending(rt, "old", 500, LONG);
-		recordPending(rt, "new", 700, LONG);
-		recordContextToolCallIds(rt, ["old"]);
-		recordContextToolCallIds(rt, ["new"]);
-		const summary = pendingSummary(rt);
-		expect(summary.items).toEqual([{ id: "new", tokens: 700 }]);
-		expect(summary.totalTokens).toBe(700);
-	});
-
-	it("is empty when no context event has fired yet", () => {
-		const rt = createRuntimeState();
-		recordPending(rt, "a", 100, LONG);
-		expect(pendingSummary(rt)).toEqual({ items: [], totalTokens: 0 });
 	});
 });
 
@@ -242,5 +186,24 @@ describe("buildSteeringMessage", () => {
 	it("ends with the id list", () => {
 		const msg = buildSteeringMessage(1, 30000, [{ id: "solo", tokens: 30000 }]);
 		expect(msg.trimEnd().endsWith("- solo (~30000 tokens)")).toBe(true);
+	});
+
+	it("appends the expired-ids line after the id list when announce data is present", () => {
+		const msg = buildSteeringMessage(1, 30000, [{ id: "solo", tokens: 30000 }], [
+			"dead-1",
+			"dead-2",
+		]);
+		expect(msg).toContain(
+			"Expired (no longer worth replacing; leave them): dead-1, dead-2",
+		);
+		// The line comes after the live list.
+		expect(msg.indexOf("- solo")).toBeLessThan(msg.indexOf("Expired ("));
+	});
+
+	it("omits the expired line when no ids are passed (or announce is off)", () => {
+		const msg = buildSteeringMessage(1, 30000, [{ id: "solo", tokens: 30000 }]);
+		expect(msg).not.toContain("Expired");
+		const empty = buildSteeringMessage(1, 30000, [{ id: "solo", tokens: 30000 }], []);
+		expect(empty).not.toContain("Expired");
 	});
 });

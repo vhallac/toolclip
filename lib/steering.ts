@@ -5,11 +5,12 @@
  * markers but never circles back to call `replace_tool_result` — it *collects*
  * pending replacements, deferring "until I need this" and then never does.
  *
- * Single trigger: the **pending mass** S — the total original estimated
- * tokens of *eligible* pending entries — against one Fibonacci ladder of
- * rungs. Eligibility (decided by `pendingSummary` against the id set
- * recorded from the most recent `context` event) gives the rule two wanted
- * behaviors for free:
+ * Single trigger: the **pending mass** — `pileTotal` in the runtime state,
+ * maintained by lib/expiry.ts as the sum of original estimated tokens over
+ * *tracked* entries (pending, counted, not expired) — against one Fibonacci
+ * ladder of rungs. Eligibility is decided by expiry's counting rule against
+ * the id set recorded from the most recent `context` event; it gives the
+ * rule two wanted behaviors for free:
  *
  * - A result marked during the current turn is not yet in the last
  *   `context` event's messages, so it is not eligible until the model has
@@ -29,10 +30,12 @@
  * size-only ladder covers both, because both shapes are just mass.
  *
  * Ratchet state: one integer `level` — the number of rungs already
- * announced. At every `turn_end`, after computing S:
+ * announced. At every `turn_end`, after pileTotal is updated (counting,
+ * compaction, expiry — none of which the ladder sees; it reads the total as
+ * it stands):
  *
- *   c = crossedRungs(S)      // rungs strictly below S
- *   if c < level: level = c  // re-arm; S only falls via replacement or compaction
+ *   c = crossedRungs(pileTotal)  // rungs strictly below the total
+ *   if c < level: level = c      // re-arm; the total only falls via replacement or compaction
  *   if c > level: fire ONE nag; level = c
  *
  * Comparison is strict (S == a rung does not cross it) and a multi-rung
@@ -72,8 +75,6 @@
  * ladder, the eligibility decision plus the message builder. No pi deps,
  * no I/O — mirrors the testable shape used by the rest of `lib/`.
  */
-
-import type { ToolclipRuntimeState } from "./types.ts";
 
 /**
  * Per-round steering ratchet state. Reset at each round boundary (in
@@ -196,33 +197,6 @@ export function observePendingSteering(
 }
 
 /**
- * Summarize the *eligible* pending entries: pending (no replacement
- * stored) entries whose toolCallId appears in the messages of the most
- * recent `context` event — ids in insertion order with their original
- * estimated token counts, plus the total mass S. An entry marked during
- * the current turn is not yet in the last context event's messages, so it
- * is not eligible until the model has had one response to act on it;
- * entries compacted away have left the messages and stop counting.
- */
-export function pendingSummary(rt: ToolclipRuntimeState): {
-	items: PendingItem[];
-	totalTokens: number;
-} {
-	const items: PendingItem[] = [];
-	let totalTokens = 0;
-	for (const [id, entry] of rt.entries) {
-		if (
-			entry.replacement === undefined &&
-			rt.lastContextToolCallIds.has(id)
-		) {
-			items.push({ id, tokens: entry.originalTokens });
-			totalTokens += entry.originalTokens;
-		}
-	}
-	return { items, totalTokens };
-}
-
-/**
  * Build the steering reminder text: a count and total-size summary, the
  * extract-then-replace method, the anti-hoarding rule ("do not save for just
  * in case"), and the explicit list of pending ids with their sizes so the
@@ -230,15 +204,25 @@ export function pendingSummary(rt: ToolclipRuntimeState): {
  * call — and can see at a glance which single item is hogging the pile.
  * Kept short and imperative.
  *
- * @param count - How many eligible results are still un-replaced.
- * @param totalTokens - Total estimated tokens across the eligible pile.
- * @param items - The eligible pending items (id + estimated tokens), in
+ * When expiry has removed entries since the last nag that listed them
+ * (`expiredIds` non-empty), one trailing line tells the model those results
+ * are no longer worth replacing and to leave them alone — without it, a
+ * model working from an older nag's id list would burn calls on ids the
+ * pay-back model has already written off (the calls would be silently
+ * ignored, but silence invites retries).
+ *
+ * @param count - How many live tracked results are still un-replaced.
+ * @param totalTokens - Total estimated tokens across the live tracked pile.
+ * @param items - The live tracked pending items (id + estimated tokens), in
  *   reported order.
+ * @param expiredIds - Ids expired since the last nag that listed them, when
+ *   announce is on; omitted (or empty) for no line.
  */
 export function buildSteeringMessage(
 	count: number,
 	totalTokens: number,
 	items: PendingItem[],
+	expiredIds?: string[],
 ): string {
 	const lines = [
 		`Steering: you have ${count} tool-result-pending-replacements totalling ~${totalTokens} estimated tokens — ` +
@@ -250,6 +234,9 @@ export function buildSteeringMessage(
 	];
 	for (const item of items) {
 		lines.push(`- ${item.id} (~${item.tokens} tokens)`);
+	}
+	if (expiredIds && expiredIds.length > 0) {
+		lines.push(`Expired (no longer worth replacing; leave them): ${expiredIds.join(", ")}`);
 	}
 	return lines.join("\n");
 }

@@ -1,4 +1,5 @@
 import type { ToolclipConfig } from "./types.ts";
+import { DEFAULT_EXPIRY_RHO, DEFAULT_EXPIRY_WRITE_RATIO } from "./expiry.ts";
 
 /**
  * Default minimum token count for a tool result to get a pending marker.
@@ -39,6 +40,18 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
 	return n;
 }
 
+/** Parse a finite float, rejecting values below `min` (used for price priors). */
+function parseNumber(value: string | undefined, fallback: number, min: number): number {
+	if (value === undefined) {
+		return fallback;
+	}
+	const n = Number(value);
+	if (!Number.isFinite(n) || n < min) {
+		return fallback;
+	}
+	return n;
+}
+
 /**
  * Load toolclip configuration.
  *
@@ -73,6 +86,21 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
  * the payload is held in memory until read, retrievable via
  * `read_quarantined_result` ("held until read; freed after reading").
  * Disable to fall back to plain pending markers for all sizes.
+ *
+ * Expiry: a pending result older than the point where replacing it still
+ * pays back is "expired" — replacing it would rewrite more cached suffix
+ * than it saves over the expected remaining turns. Expired entries are
+ * deleted from the tracker, dropped from the nag, and any replace call
+ * naming them is silently ignored (`ok: true, ignored: "expired"` — never
+ * an error). The pay-back test compares the tokens appended since the
+ * entry was first counted (S_i) against `rho/(w - rho) * net_i * H`, with
+ * net_i the per-turn saving (original minus COPIES×R minus OVERHEAD, R the
+ * assumed replacement size) and H the clamped turn horizon; rho and w are
+ * EMA-measured from per-turn usage costs, starting at the
+ * `expiryRho`/`expiryWriteRatio` priors. Three or more consecutive turns
+ * without cache activity freeze expiry. Expiry never modifies `pileTotal`
+ * (the ladder's total) and is monotone — expired ids are never re-armed.
+ * Gated by `TOOLCLIP_EXPIRY` (false: no expiry, ladder-only).
  */
 export function loadToolclipConfig(env: NodeJS.ProcessEnv = process.env): ToolclipConfig {
 	return {
@@ -90,5 +118,14 @@ export function loadToolclipConfig(env: NodeJS.ProcessEnv = process.env): Toolcl
 			env.TOOLCLIP_QUARANTINE_THRESHOLD_TOKENS,
 			DEFAULT_QUARANTINE_THRESHOLD_TOKENS,
 		),
+		expiry: parseBool(env.TOOLCLIP_EXPIRY, true),
+		expiryRho: parseNumber(env.TOOLCLIP_EXPIRY_RHO, DEFAULT_EXPIRY_RHO, 0),
+		expiryWriteRatio: parseNumber(env.TOOLCLIP_EXPIRY_WRITE_RATIO, DEFAULT_EXPIRY_WRITE_RATIO, 0),
+		expiryReplacementTokens: parsePositiveInt(env.TOOLCLIP_EXPIRY_REPLACEMENT_TOKENS, 170),
+		expiryReplacementCopies: parsePositiveInt(env.TOOLCLIP_EXPIRY_REPLACEMENT_COPIES, 2),
+		expiryOverheadTokens: parsePositiveInt(env.TOOLCLIP_EXPIRY_OVERHEAD_TOKENS, 60),
+		expiryHorizonMinTurns: parsePositiveInt(env.TOOLCLIP_EXPIRY_HORIZON_MIN_TURNS, 10),
+		expiryHorizonMaxTurns: parsePositiveInt(env.TOOLCLIP_EXPIRY_HORIZON_MAX_TURNS, 100),
+		expiryAnnounce: parseBool(env.TOOLCLIP_EXPIRY_ANNOUNCE, true),
 	};
 }

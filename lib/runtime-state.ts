@@ -15,11 +15,22 @@
  */
 
 import type { ToolclipRuntimeState } from "./types.ts";
+import { DEFAULT_EXPIRY_RHO, DEFAULT_EXPIRY_WRITE_RATIO } from "./expiry.ts";
+
+/** Price priors seeding the expiry state (see lib/expiry.ts). */
+export interface ExpiryPriors {
+	rho: number;
+	writeRatio: number;
+}
 
 /**
  * Create a fresh, empty runtime state.
+ *
+ * @param priors - optional price priors for the expiry accounting; defaults
+ *   to the same values as the config defaults (rho 0.2, write ratio 1.0).
+ *   The extension passes the loaded config's priors.
  */
-export function createRuntimeState(): ToolclipRuntimeState {
+export function createRuntimeState(priors?: ExpiryPriors): ToolclipRuntimeState {
 	return {
 		entries: new Map(),
 		quarantines: new Map(),
@@ -27,6 +38,16 @@ export function createRuntimeState(): ToolclipRuntimeState {
 		currentTurn: 0,
 		lastContextToolCallIds: new Set(),
 		readsThisRound: new Map(),
+		pileTotal: 0,
+		turnsSeen: 0,
+		lastCtx: 0,
+		rho: priors?.rho ?? DEFAULT_EXPIRY_RHO,
+		w: priors?.writeRatio ?? DEFAULT_EXPIRY_WRITE_RATIO,
+		noCacheStreak: 0,
+		replMeanTokens: 0,
+		replCount: 0,
+		expiredIds: new Set(),
+		expiredUnannounced: new Set(),
 	};
 }
 
@@ -34,8 +55,8 @@ export function createRuntimeState(): ToolclipRuntimeState {
  * Record the tool-call ids present in the messages of the most recent
  * `context` event, replacing any previous set. State only — the context
  * handler stays a pure view transform and returns the same swapped
- * messages. Steering eligibility is defined against this set (see
- * `pendingSummary` in lib/steering.ts).
+ * messages. Steering eligibility and expiry counting are defined against
+ * this set (see `trackedSummary` and `countNewlyEligible` in lib/expiry.ts).
  *
  * @param state - The runtime state to mutate.
  * @param ids - The toolCallIds of the toolResult messages in the context
@@ -56,6 +77,14 @@ export function recordContextToolCallIds(
  * overwrites an existing one (later writes win — useful when a tool is
  * retried and the second result is the one we should track).
  *
+ * A fresh entry starts uncounted (`counted = false`, `ctxSeen = 0`): it
+ * joins `pileTotal` only at the turn_end where it first becomes eligible
+ * (see `countNewlyEligible` in lib/expiry.ts). When the overwrite replaces
+ * an entry that was already counted, the stale entry's contribution is
+ * subtracted from `pileTotal` first, so a re-marked result never
+ * double-counts — the fresh content is re-counted at the next eligible
+ * turn_end with a fresh `ctxSeen`.
+ *
  * @param state - The runtime state to mutate.
  * @param toolCallId - The tool call id.
  * @param originalTokens - Estimated token count of the original result.
@@ -67,9 +96,17 @@ export function recordPending(
 	originalTokens: number,
 	originalContent: string,
 ): void {
+	const previous = state.entries.get(toolCallId);
+	if (previous?.counted) {
+		// The old content contributed to pileTotal at its counting time; its
+		// contribution is stale once the result is re-recorded.
+		state.pileTotal -= previous.originalTokens;
+	}
 	state.entries.set(toolCallId, {
 		originalTokens,
 		originalContent,
+		counted: false,
+		ctxSeen: 0,
 		// replacement intentionally omitted until recordReplacement is called
 	});
 }
@@ -160,8 +197,24 @@ export function replacedIds(state: ToolclipRuntimeState): string[] {
 
 /**
  * Wipe the state. Used by tests and by future restart logic if any.
+ *
+ * Full reset: entries, the last-context id set, and all expiry accounting
+ * (pileTotal, turnsSeen, prices, streaks, replacement stats, expired ids).
+ * Note this is a whole-state wipe — NOT the per-round reset, which only
+ * resets the steering ratchet and the re-read counter (`turnsSeen` and the
+ * expired ids deliberately survive round boundaries).
  */
 export function clear(state: ToolclipRuntimeState): void {
 	state.entries.clear();
 	state.lastContextToolCallIds.clear();
+	state.pileTotal = 0;
+	state.turnsSeen = 0;
+	state.lastCtx = 0;
+	state.rho = DEFAULT_EXPIRY_RHO;
+	state.w = DEFAULT_EXPIRY_WRITE_RATIO;
+	state.noCacheStreak = 0;
+	state.replMeanTokens = 0;
+	state.replCount = 0;
+	state.expiredIds.clear();
+	state.expiredUnannounced.clear();
 }

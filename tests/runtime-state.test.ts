@@ -5,10 +5,12 @@ import {
 	getEntry,
 	getReplacement,
 	pendingIds,
+	recordContextToolCallIds,
 	recordPending,
 	recordReplacement,
 	replacedIds,
 } from "../lib/runtime-state.js";
+import { countNewlyEligible } from "../lib/expiry.ts";
 
 describe("createRuntimeState", () => {
 	it("starts empty", () => {
@@ -154,15 +156,68 @@ describe("getReplacement", () => {
 	});
 });
 
-describe("clear", () => {
-	it("wipes all entries", () => {
-		const state = createRuntimeState();
-		recordPending(state, "a", 1, "A");
-		recordPending(state, "b", 2, "B");
-		recordReplacement(state, "a", "ta", 1);
-		clear(state);
-		expect(state.entries.size).toBe(0);
-		expect(pendingIds(state)).toEqual([]);
-		expect(replacedIds(state)).toEqual([]);
+	describe("clear", () => {
+		it("wipes all entries", () => {
+			const state = createRuntimeState();
+			recordPending(state, "a", 1, "A");
+			recordPending(state, "b", 2, "B");
+			recordReplacement(state, "a", "ta", 1);
+			clear(state);
+			expect(state.entries.size).toBe(0);
+			expect(pendingIds(state)).toEqual([]);
+			expect(replacedIds(state)).toEqual([]);
+		});
+
+		it("resets the expiry accounting to fresh defaults", () => {
+			const state = createRuntimeState({ rho: 0.1, writeRatio: 1.25 });
+			recordPending(state, "a", 500, "A");
+			recordContextToolCallIds(state, ["a"]);
+			countNewlyEligible(state, 20000);
+			state.turnsSeen = 7;
+			state.lastCtx = 20000;
+			state.noCacheStreak = 2;
+			state.expiredIds.add("ghost");
+			state.expiredUnannounced.add("ghost");
+
+			clear(state);
+			expect(state.pileTotal).toBe(0);
+			expect(state.turnsSeen).toBe(0);
+			expect(state.lastCtx).toBe(0);
+			expect(state.rho).toBe(0.2);
+			expect(state.w).toBe(1.0);
+			expect(state.noCacheStreak).toBe(0);
+			expect(state.replMeanTokens).toBe(0);
+			expect(state.replCount).toBe(0);
+			expect(state.expiredIds.size).toBe(0);
+			expect(state.expiredUnannounced.size).toBe(0);
+		});
 	});
-});
+
+	describe("recordPending — pileTotal correction on re-mark", () => {
+		it("subtracts a counted entry's stale contribution when the result is re-recorded", () => {
+			const state = createRuntimeState();
+			recordPending(state, "a", 300, "first");
+			recordContextToolCallIds(state, ["a"]);
+			countNewlyEligible(state, 5000);
+			expect(state.pileTotal).toBe(300);
+
+			// Same id re-marked (tool retried, fresh content): the counted
+			// contribution of the old content must not linger in the pile.
+			recordPending(state, "a", 700, "second");
+			expect(state.pileTotal).toBe(0);
+			expect(state.entries.get("a")).toMatchObject({ counted: false, ctxSeen: 0 });
+
+			// It re-counts with a fresh ctxSeen once eligible again.
+			recordContextToolCallIds(state, ["a"]);
+			countNewlyEligible(state, 9000);
+			expect(state.pileTotal).toBe(700);
+			expect(state.entries.get("a")).toMatchObject({ counted: true, ctxSeen: 9000 });
+		});
+
+		it("leaves pileTotal alone when overwriting an uncounted entry", () => {
+			const state = createRuntimeState();
+			recordPending(state, "a", 300, "first");
+			recordPending(state, "a", 700, "second");
+			expect(state.pileTotal).toBe(0);
+		});
+	});
