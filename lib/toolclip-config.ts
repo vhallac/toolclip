@@ -8,19 +8,11 @@ import type { ToolclipConfig } from "./types.ts";
 const DEFAULT_TOOL_RESULT_THRESHOLD_TOKENS = 1000;
 
 /**
- * Default pending-count threshold for the steering reminder: it fires when
- * the number of un-replaced pending results strictly exceeds this value,
- * and re-arms when the count falls back to it or below.
+ * Default first rung of the steering ladder (estimated tokens): the nag
+ * fires once the eligible pending mass strictly exceeds this, then at each
+ * higher Fibonacci rung (1.6×, 2.6×, 4.2×, 6.8×, ... of this value).
  */
-const DEFAULT_STEERING_COUNT_THRESHOLD = 5;
-
-/**
- * Default total-size threshold (estimated tokens) for the steering
- * reminder: it fires when the un-replaced pending pile strictly exceeds
- * this, and re-arms when the total falls back to it or below. Catches the
- * single-huge-item case the count trigger is blind to (count = 1).
- */
-const DEFAULT_STEERING_SIZE_THRESHOLD_TOKENS = 5000;
+const DEFAULT_STEERING_FIRST_RUNG_TOKENS = 5000;
 
 /**
  * Default minimum token count for a tool result to be quarantined. Well
@@ -60,16 +52,21 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
  * a replacement grew larger than its original (the observation target); no
  * rejection happens.
  *
- * The steering reminder is delivered via pi's native steering when either
- * trigger fires: the number of un-replaced pending results strictly exceeds
- * `steeringCountThreshold` (default 5), or their total estimated size
- * strictly exceeds `steeringSizeThresholdTokens` (default 5000). Each
- * trigger nags once per excursion (its latch re-arms when its condition
- * falls back to the threshold), and the two latches are independent — one
- * trigger's fire never suppresses the other's. The reminder lists the
- * pending ids with their sizes. It is sent with `deliverAs: "steer"`, so pi
- * persists it as a real user message at the next turn boundary — part of
- * the session's messages, visible in every subsequent LLM call.
+ * The steering reminder is delivered via pi's native steering when the
+ * eligible pending mass (the total original estimated tokens of pending
+ * entries whose ids are in the most recent context event's messages)
+ * crosses a rung of the Fibonacci ladder whose first rung is
+ * `steeringFirstRungTokens` — gated by `TOOLCLIP_STEERING_SIZE_THRESHOLD_TOKENS`
+ * (default 5000; the env var's name predates the ladder and is kept, it now
+ * means "first rung"). Rungs sit at 1×, 1.6×, 2.6×, 4.2×, 6.8×, ... of the
+ * first rung (5000, 8000, 13000, 21000, 34000, ... by default). A single
+ * ratchet (`level` — rungs already announced) nags once per rung crossing
+ * (one nag even when several rungs are crossed at once), re-arms down when
+ * the mass falls below an announced rung, and resets at each round
+ * boundary. The reminder lists the eligible pending ids with their sizes.
+ * It is sent with `deliverAs: "steer"`, so pi persists it as a real user
+ * message at the next turn boundary — part of the session's messages,
+ * visible in every subsequent LLM call.
  *
  * Quarantine: results above `quarantineThresholdTokens` (default 10000) are
  * withheld from the LLM entirely — the content is swapped for a notice and
@@ -84,13 +81,9 @@ export function loadToolclipConfig(env: NodeJS.ProcessEnv = process.env): Toolcl
 			DEFAULT_TOOL_RESULT_THRESHOLD_TOKENS,
 		),
 		steeringReminder: parseBool(env.TOOLCLIP_STEERING_REMINDER, true),
-		steeringCountThreshold: parsePositiveInt(
-			env.TOOLCLIP_STEERING_COUNT_THRESHOLD,
-			DEFAULT_STEERING_COUNT_THRESHOLD,
-		),
-		steeringSizeThresholdTokens: parsePositiveInt(
+		steeringFirstRungTokens: parsePositiveInt(
 			env.TOOLCLIP_STEERING_SIZE_THRESHOLD_TOKENS,
-			DEFAULT_STEERING_SIZE_THRESHOLD_TOKENS,
+			DEFAULT_STEERING_FIRST_RUNG_TOKENS,
 		),
 		quarantine: parseBool(env.TOOLCLIP_QUARANTINE, true),
 		quarantineThresholdTokens: parsePositiveInt(

@@ -30,22 +30,14 @@ export interface ToolclipConfig {
 	 */
 	steeringReminder: boolean;
 	/**
-	 * Pending-count threshold for the steering reminder: it fires when the
-	 * number of un-replaced pending results strictly exceeds this value,
-	 * and re-arms when the count falls back to it or below (one nag per
-	 * excursion). Defaults to `5`. Gated by
-	 * `TOOLCLIP_STEERING_COUNT_THRESHOLD`.
+	 * First rung of the steering ladder (estimated tokens): the nag fires
+	 * once the eligible pending mass strictly exceeds this, then at each
+	 * higher Fibonacci rung (1.6×, 2.6×, 4.2×, 6.8×, ...). Defaults to
+	 * `5000`. Gated by `TOOLCLIP_STEERING_SIZE_THRESHOLD_TOKENS` — the env
+	 * var's name predates the ladder and is kept; it now means "first
+	 * rung", not a flat threshold.
 	 */
-	steeringCountThreshold: number;
-	/**
-	 * Total-size threshold (estimated tokens) for the steering reminder: it
-	 * fires when the un-replaced pending pile strictly exceeds this, and
-	 * re-arms when the total falls back to it or below. Independent of the
-	 * count trigger — it catches a single huge un-replaced result (count of
-	 * 1), which the count trigger is structurally blind to. Defaults to
-	 * `5000`. Gated by `TOOLCLIP_STEERING_SIZE_THRESHOLD_TOKENS`.
-	 */
-	steeringSizeThresholdTokens: number;
+	steeringFirstRungTokens: number;
 	/**
 	 * Whether oversized tool results are quarantined (content swapped for a
 	 * notice, payload held until read). Defaults to `true`. Gated by
@@ -113,6 +105,15 @@ export interface QuarantineEntry {
  * marker for a quarantine notice, and the denial then points it at the
  * distillation path instead.
  * `currentTurn` mirrors pi's turn index, maintained via `turn_start`.
+ * `lastContextToolCallIds` holds the tool-call ids present in the messages
+ * of the most recent `context` event — recorded each time the context
+ * event fires (state only; the handler still returns the same swapped
+ * messages). Steering eligibility is defined against this set: a pending
+ * entry is eligible while its id is in the messages the model most
+ * recently saw. A result marked during the current turn is not yet in the
+ * last context event, so it is not eligible until the model has had one
+ * response to act on it; entries compacted away are no longer in the
+ * messages, so they stop counting.
  * `readsThisRound` counts successful read results per path within the
  * current round (re-read observation; reset at each round boundary).
  */
@@ -121,5 +122,6 @@ export interface ToolclipRuntimeState {
 	quarantines: Map<string, QuarantineEntry>;
 	releasedQuarantines: Set<string>;
 	currentTurn: number;
+	lastContextToolCallIds: Set<string>;
 	readsThisRound: Map<string, number>;
 }

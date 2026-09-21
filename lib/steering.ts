@@ -5,33 +5,47 @@
  * markers but never circles back to call `replace_tool_result` — it *collects*
  * pending replacements, deferring "until I need this" and then never does.
  *
- * Two independent triggers, each edge-triggered with its own latch ("once
- * per excursion"):
+ * Single trigger: the **pending mass** S — the total original estimated
+ * tokens of *eligible* pending entries — against one Fibonacci ladder of
+ * rungs. Eligibility (decided by `pendingSummary` against the id set
+ * recorded from the most recent `context` event) gives the rule two wanted
+ * behaviors for free:
  *
- * - **count**: the number of un-replaced pending results strictly exceeds
- *   `countThreshold` (default 5). Fires once when the pile crosses the
- *   threshold; the latch re-arms when the count falls back to the threshold
- *   or below — so a pile that is partially replaced and then re-grown is
- *   nagged again, while one that stays above the threshold is not re-nagged
- *   on every LLM call.
- * - **size**: the total estimated tokens of un-replaced pending results
- *   strictly exceeds `sizeThresholdTokens` (default 5000). This catches
- *   what the count trigger is structurally blind to: a single huge un-
- *   replaced result never exceeds a count of 5 — the 2026-09-20 golden run
- *   left a ~30k-token base64 blob pending for 24 calls with no nag at all.
+ * - A result marked during the current turn is not yet in the last
+ *   `context` event's messages, so it is not eligible until the model has
+ *   had one response to act on it.
+ * - Results compacted away are no longer in the messages, so they stop
+ *   counting — the pile tracks what the model actually still carries.
  *
- * The latches are independent on purpose. A single shared latch would let
- * one trigger's fire mask the other's later crossing: the count nag fires,
- * the pile is distilled down to one huge item, and the size trigger — the
- * only one that can still catch it — would stay suppressed. With separate
- * latches, each threshold nags once per excursion above it, and a nag for
- * one trigger never silences the other.
+ * The ladder: rung(k) = round(first * F(k) / 5) with F(1) = 5, F(2) = 8,
+ * F(k+1) = F(k) + F(k-1) — firstRung, 1.6×, 2.6×, 4.2×, 6.8×, ... (5000,
+ * 8000, 13000, 21000, 34000, 55000, 89000, ... at the default first rung;
+ * 10000, 16000, 26000, 42000, 68000, ... with firstRung = 10000). The
+ * geometric growth keeps the nag cadence sparse exactly where nags are
+ * cheap (small piles self-correct with one batched call) while guaranteeing
+ * a nag for any pile size — the earlier pair of flat thresholds needed two
+ * triggers (count + size) with independent latches to cover both the
+ * many-small-items and the single-huge-blob failure shapes; one
+ * size-only ladder covers both, because both shapes are just mass.
  *
- * Round boundary: state resets at each round boundary (in
- * `before_agent_start`) so a pile persisting into a new round is re-announced
- * at that round's first turn boundary.
+ * Ratchet state: one integer `level` — the number of rungs already
+ * announced. At every `turn_end`, after computing S:
  *
- * Delivery: pi-native steering. On a trigger fire the caller enqueues the
+ *   c = crossedRungs(S)      // rungs strictly below S
+ *   if c < level: level = c  // re-arm; S only falls via replacement or compaction
+ *   if c > level: fire ONE nag; level = c
+ *
+ * Comparison is strict (S == a rung does not cross it) and a multi-rung
+ * jump announces only one nag — the pile just got bigger, and the message
+ * already lists every eligible id; repeating per rung would only add
+ * identical nags to the same boundary. When the pile shrinks through a
+ * level, the level re-arms down, so a re-grown pile is nagged again.
+ *
+ * Round boundary: `level` resets to 0 at each round boundary (in
+ * `before_agent_start`) so a pile persisting into a new round is
+ * re-announced at that round's first turn boundary.
+ *
+ * Delivery: pi-native steering. On a fire the caller enqueues the
  * reminder via `api.sendUserMessage(text, { deliverAs: "steer" })` — pi's
  * real steering path. The message is queued on the agent's steering queue,
  * drained at the next turn boundary, and PERSISTED as a real user message
@@ -40,58 +54,55 @@
  * summarization. That persistence is the point — a nag that flashes for a
  * single LLM call (a synthetic append in the `context` handler) is
  * structurally incapable of nagging: the post-fix golden run of 2026-09-20
- * showed the pile above both thresholds for 119 consecutive calls while the
+ * showed the pile above the rungs for 119 consecutive calls while the
  * model saw each nag exactly once.
  *
  * Observation point: `turn_end`, after the turn's tool results are in and
- * replacements recorded — the freshest pile state the boundary can see. The
- * agent loop polls the steering queue immediately after `turn_end`, so a
- * steer enqueued there is delivered at that same boundary: visible from the
- * very next LLM call onward. Two consequences of the native path: a pile
- * above threshold at a run's final turn forces one more turn (the model must
- * at least see the nag), and the message text is computed at observation
- * time — ids and totals can be mildly stale if a later turn changes the pile
- * before the message is read (subsequent observations still fire on correct
- * data).
+ * replacements recorded — the freshest *eligible* pile state the boundary
+ * can see. The agent loop polls the steering queue immediately after
+ * `turn_end`, so a steer enqueued there is delivered at that same
+ * boundary: visible from the very next LLM call onward. Two consequences
+ * of the native path: a pile above the announced rungs at a run's final
+ * turn forces one more turn (the model must at least see the nag), and the
+ * message text is computed at observation time — ids and totals can be
+ * mildly stale if a later turn changes the pile before the message is read
+ * (subsequent observations still fire on correct data).
  *
  * This module is pure: it owns the per-round steering state and exposes the
- * eligibility decision plus the message builder. No pi deps, no I/O — mirrors
- * the testable shape used by the rest of `lib/`.
+ * ladder, the eligibility decision plus the message builder. No pi deps,
+ * no I/O — mirrors the testable shape used by the rest of `lib/`.
  */
 
 import type { ToolclipRuntimeState } from "./types.ts";
 
 /**
- * Per-round steering state. Reset at each round boundary (in
- * `before_agent_start`) so a pile persisting into a new round is re-announced
- * at that round's first turn boundary.
+ * Per-round steering ratchet state. Reset at each round boundary (in
+ * `before_agent_start`) so a pile persisting into a new round is
+ * re-announced at that round's first turn boundary.
  *
- * Each latch is true once its trigger has fired for the current excursion
- * above its threshold; both re-arm when their condition falls back to (or
- * below) the threshold. The latches are independent: a fire of one trigger
- * never suppresses the other.
+ * `level` is the number of ladder rungs already announced for the current
+ * round: a fire happens only when `crossed(S)` exceeds it, and it re-arms
+ * down whenever the crossed count falls below it.
  */
 export interface SteeringState {
-	/** True once the count trigger has fired for the current excursion. */
-	countLatched: boolean;
-	/** True once the size trigger has fired for the current excursion. */
-	sizeLatched: boolean;
+	/** Rungs already announced (crossed count at the last fire). */
+	level: number;
 }
 
 /** Options for the steering eligibility decision (from `ToolclipConfig`). */
 export interface SteeringOptions {
-	/** Nag when the pending count strictly exceeds this. */
-	countThreshold: number;
-	/** Nag when the total pending estimated tokens strictly exceed this. */
-	sizeThresholdTokens: number;
-	/** Master switch; when false nothing fires and no latch is tracked. */
+	/**
+	 * First ladder rung (estimated tokens): the nag fires once the pending
+	 * mass strictly exceeds this, then at each higher Fibonacci rung.
+	 */
+	firstRungTokens: number;
+	/** Master switch; when false nothing fires and no level is tracked. */
 	enabled: boolean;
 }
 
-/** Which triggers fired on this observation (at most one message is sent). */
-export interface SteeringTriggers {
-	count: boolean;
-	size: boolean;
+/** The decision of one steering observation: whether a nag should fire. */
+export interface SteeringDecision {
+	fire: boolean;
 }
 
 /** One un-replaced pending result: its id and original estimated tokens. */
@@ -104,7 +115,7 @@ export interface PendingItem {
  * Create fresh steering state for a new round.
  */
 export function createSteeringState(): SteeringState {
-	return { countLatched: false, sizeLatched: false };
+	return { level: 0 };
 }
 
 /**
@@ -113,13 +124,85 @@ export function createSteeringState(): SteeringState {
  * object survives across rounds without re-allocation.
  */
 export function resetSteering(state: SteeringState): void {
-	state.countLatched = false;
-	state.sizeLatched = false;
+	state.level = 0;
 }
 
 /**
- * Summarize the un-replaced pending results: ids in insertion order with
- * their original estimated token counts, plus the total.
+ * Count the ladder rungs strictly below `totalTokens` — the number of rungs
+ * the pending mass has crossed.
+ *
+ * Rungs: rung(k) = round(firstRung * F(k) / 5) with F(1) = 5, F(2) = 8,
+ * F(k+1) = F(k) + F(k-1) — firstRung, 1.6×firstRung, 2.6×, 4.2×, 6.8×,
+ * 11×, ... (5000, 8000, 13000, 21000, 34000, 55000, 89000, ... at the
+ * default; 10000, 16000, 26000, 42000, 68000, ... with firstRung = 10000).
+ * Comparison is strict: `totalTokens == rung` does not cross it. Rungs are
+ * generated by iteration until one reaches `totalTokens`, so the function
+ * terminates for any mass.
+ */
+export function crossedRungs(totalTokens: number, firstRung: number): number {
+	let crossed = 0;
+	// F(1) = 5: rung(1) is firstRung itself.
+	if (firstRung < totalTokens) {
+		crossed = 1;
+	} else {
+		return 0;
+	}
+	let fPrev = 5; // F(k-1) once k >= 2
+	let f = 8; // F(2)
+	for (;;) {
+		const rung = Math.round((firstRung * f) / 5);
+		if (rung >= totalTokens) {
+			return crossed;
+		}
+		crossed += 1;
+		const next = fPrev + f;
+		fPrev = f;
+		f = next;
+	}
+}
+
+/**
+ * Apply the steering ratchet to a pending-mass observation (the caller
+ * observes from `turn_end`, after the turn's tool results are in — one
+ * observation per turn).
+ *
+ * `state.level` is the number of rungs already announced. When the crossed
+ * count rises above it, ONE nag fires (even if several rungs were crossed
+ * at once) and the level is raised to the crossed count; when the crossed
+ * count falls below it — the mass only falls via replacements or
+ * compaction — the level re-arms down so a re-grown pile is nagged again.
+ * When steering is disabled, nothing fires and no level is tracked.
+ */
+export function observePendingSteering(
+	state: SteeringState,
+	totalTokens: number,
+	options: SteeringOptions,
+): SteeringDecision {
+	if (!options.enabled) {
+		return { fire: false };
+	}
+	const crossed = crossedRungs(totalTokens, options.firstRungTokens);
+	if (crossed < state.level) {
+		// Re-arm: the pile shrank below an announced rung (replacements or
+		// compaction), so re-announce if it re-grows.
+		state.level = crossed;
+	}
+	if (crossed > state.level) {
+		// One nag per multi-rung jump; the level catches up in full.
+		state.level = crossed;
+		return { fire: true };
+	}
+	return { fire: false };
+}
+
+/**
+ * Summarize the *eligible* pending entries: pending (no replacement
+ * stored) entries whose toolCallId appears in the messages of the most
+ * recent `context` event — ids in insertion order with their original
+ * estimated token counts, plus the total mass S. An entry marked during
+ * the current turn is not yet in the last context event's messages, so it
+ * is not eligible until the model has had one response to act on it;
+ * entries compacted away have left the messages and stop counting.
  */
 export function pendingSummary(rt: ToolclipRuntimeState): {
 	items: PendingItem[];
@@ -128,62 +211,15 @@ export function pendingSummary(rt: ToolclipRuntimeState): {
 	const items: PendingItem[] = [];
 	let totalTokens = 0;
 	for (const [id, entry] of rt.entries) {
-		if (entry.replacement === undefined) {
+		if (
+			entry.replacement === undefined &&
+			rt.lastContextToolCallIds.has(id)
+		) {
 			items.push({ id, tokens: entry.originalTokens });
 			totalTokens += entry.originalTokens;
 		}
 	}
 	return { items, totalTokens };
-}
-
-/**
- * Collect the ids of tracked tool results that are still pending (recorded
- * but not yet replaced). Reads from the shared runtime state. The count of
- * pending results is `ids.length`.
- */
-export function unreplacedPendingIds(rt: ToolclipRuntimeState): string[] {
-	return pendingSummary(rt).items.map((item) => item.id);
-}
-
-/**
- * Observe the current pending pile and decide whether a steering reminder
- * should fire at this turn boundary (the caller observes from `turn_end`,
- * after the turn's tool results are in — one observation per turn).
- *
- * Each trigger is edge-triggered with its own latch: it fires exactly when
- * its condition first becomes true (strictly above the threshold) and latches
- * until the condition falls back to the threshold or below. Mutates
- * `state.countLatched` / `state.sizeLatched`. Returns which triggers fired —
- * the caller sends at most one reminder per observation.
- */
-export function observePendingSteering(
-	state: SteeringState,
-	count: number,
-	totalTokens: number,
-	options: SteeringOptions,
-): SteeringTriggers {
-	if (!options.enabled) {
-		return { count: false, size: false };
-	}
-	// Re-arm on excursion end first, so the latch follows the pile down in
-	// the same observation that sees the drop (mirrors the re-arm semantics
-	// of the band ladder this replaced).
-	if (count <= options.countThreshold) {
-		state.countLatched = false;
-	}
-	if (totalTokens <= options.sizeThresholdTokens) {
-		state.sizeLatched = false;
-	}
-	const triggers = { count: false, size: false };
-	if (count > options.countThreshold && !state.countLatched) {
-		state.countLatched = true;
-		triggers.count = true;
-	}
-	if (totalTokens > options.sizeThresholdTokens && !state.sizeLatched) {
-		state.sizeLatched = true;
-		triggers.size = true;
-	}
-	return triggers;
 }
 
 /**
@@ -194,9 +230,10 @@ export function observePendingSteering(
  * call — and can see at a glance which single item is hogging the pile.
  * Kept short and imperative.
  *
- * @param count - How many marked results are still un-replaced.
- * @param totalTokens - Total estimated tokens across the pending pile.
- * @param items - The pending items (id + estimated tokens), in reported order.
+ * @param count - How many eligible results are still un-replaced.
+ * @param totalTokens - Total estimated tokens across the eligible pile.
+ * @param items - The eligible pending items (id + estimated tokens), in
+ *   reported order.
  */
 export function buildSteeringMessage(
 	count: number,

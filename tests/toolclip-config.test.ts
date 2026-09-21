@@ -6,8 +6,7 @@ describe("loadToolclipConfig", () => {
 		expect(loadToolclipConfig({} as NodeJS.ProcessEnv)).toEqual({
 			toolResultThresholdTokens: 1000,
 			steeringReminder: true,
-			steeringCountThreshold: 5,
-			steeringSizeThresholdTokens: 5000,
+			steeringFirstRungTokens: 5000,
 			quarantine: true,
 			quarantineThresholdTokens: 10000,
 		});
@@ -19,8 +18,7 @@ describe("loadToolclipConfig", () => {
 		} as NodeJS.ProcessEnv);
 
 		expect(config.steeringReminder).toBe(false);
-		expect(config.steeringCountThreshold).toBe(5);
-		expect(config.steeringSizeThresholdTokens).toBe(5000);
+		expect(config.steeringFirstRungTokens).toBe(5000);
 	});
 
 	it("enables the steering reminder via TOOLCLIP_STEERING_REMINDER=1", () => {
@@ -31,37 +29,27 @@ describe("loadToolclipConfig", () => {
 		expect(config.steeringReminder).toBe(true);
 	});
 
-	it("overrides the count threshold via TOOLCLIP_STEERING_COUNT_THRESHOLD", () => {
+	it("ignores the removed count trigger env var (config field is gone)", () => {
 		const config = loadToolclipConfig({
 			TOOLCLIP_STEERING_COUNT_THRESHOLD: "10",
 		} as NodeJS.ProcessEnv);
-
-		expect(config.steeringCountThreshold).toBe(10);
+		expect("steeringCountThreshold" in config).toBe(false);
 	});
 
-	it("falls back to default count threshold for non-positive or non-integer values", () => {
-		for (const bad of ["0", "-1", "2.5", "abc", ""]) {
-			const config = loadToolclipConfig({
-				TOOLCLIP_STEERING_COUNT_THRESHOLD: bad,
-			} as NodeJS.ProcessEnv);
-			expect(config.steeringCountThreshold).toBe(5);
-		}
-	});
-
-	it("overrides the size threshold via TOOLCLIP_STEERING_SIZE_THRESHOLD_TOKENS", () => {
+	it("overrides the ladder's first rung via TOOLCLIP_STEERING_SIZE_THRESHOLD_TOKENS", () => {
 		const config = loadToolclipConfig({
 			TOOLCLIP_STEERING_SIZE_THRESHOLD_TOKENS: "8000",
 		} as NodeJS.ProcessEnv);
 
-		expect(config.steeringSizeThresholdTokens).toBe(8000);
+		expect(config.steeringFirstRungTokens).toBe(8000);
 	});
 
-	it("falls back to default size threshold for non-positive or non-integer values", () => {
+	it("falls back to the default first rung for non-positive or non-integer values", () => {
 		for (const bad of ["0", "-1", "2.5", "abc", ""]) {
 			const config = loadToolclipConfig({
 				TOOLCLIP_STEERING_SIZE_THRESHOLD_TOKENS: bad,
 			} as NodeJS.ProcessEnv);
-			expect(config.steeringSizeThresholdTokens).toBe(5000);
+			expect(config.steeringFirstRungTokens).toBe(5000);
 		}
 	});
 
@@ -92,8 +80,7 @@ describe("loadToolclipConfig", () => {
 		expect(config).toEqual({
 			toolResultThresholdTokens: 1000,
 			steeringReminder: true,
-			steeringCountThreshold: 5,
-			steeringSizeThresholdTokens: 5000,
+			steeringFirstRungTokens: 5000,
 			quarantine: true,
 			quarantineThresholdTokens: 10000,
 		});

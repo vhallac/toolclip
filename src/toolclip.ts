@@ -81,6 +81,7 @@ import {
 	buildSteeringMessage,
 } from "../lib/steering.ts";
 import {
+	recordContextToolCallIds,
 	recordPending,
 	recordReplacement,
 	getReplacement,
@@ -482,9 +483,10 @@ export default function toolclip(api: ExtensionAPI): void {
 	//    into the system prompt
 	// -----------------------------------------------------------------------
 	api.on("before_agent_start", (event: BeforeAgentStartEvent) => {
-		// New round: reset the steering latches so a pending pile persisting
-		// into this round is re-announced at that round's first turn boundary, and
-		// restart the per-round re-read counter. Held quarantines are NOT cleared:
+		// New round: reset the steering ratchet (`level`) so a pending pile
+		// persisting into this round is re-announced at that round's first
+		// turn boundary, and restart the per-round re-read counter. Held
+		// quarantines are NOT cleared:
 		// payloads are held for the session's lifetime ("held until read; freed
 		// after reading") — the session file holds only the notice, so clearing
 		// here would be data destruction with no replacement.
@@ -564,8 +566,23 @@ export default function toolclip(api: ExtensionAPI): void {
 	//    and never written to the session — the nag vanished after a single
 	//    glance. Delivery now goes through pi's native steering from the
 	//    turn_end handler (section 5); see lib/steering.ts.
+	//
+	//    The handler additionally records the tool-call ids present in the
+	//    messages (state only; the returned view is unchanged). Steering
+	//    eligibility is defined against this set: a pending entry is
+	//    eligible while its id is in the messages the model most recently
+	//    saw — a result marked during the current turn is not eligible
+	//    until the model has had one response to act on it, and entries
+	//    compacted away are no longer in the messages and stop counting.
 	// -----------------------------------------------------------------------
 	api.on("context", (event: ContextEvent) => {
+		const contextIds: string[] = [];
+		for (const msg of event.messages) {
+			if (msg.role === "toolResult") {
+				contextIds.push(msg.toolCallId);
+			}
+		}
+		recordContextToolCallIds(state, contextIds);
 		return {
 			messages: event.messages.map((msg) => {
 				if (msg.role !== "toolResult") {
@@ -606,33 +623,29 @@ export default function toolclip(api: ExtensionAPI): void {
 	});
 
 	api.on("turn_end", (event: TurnEndEvent) => {
-		// Steering reminder: count + size triggers, observed at the turn
-		// boundary — after this turn's tool results are in (new pending marks
-		// and replacements recorded), so the snapshot is the freshest the
-		// boundary can see. The count trigger fires when the count strictly
-		// exceeds its threshold, the size trigger when the pile's total
-		// estimated tokens strictly exceed theirs; each latches until its
-		// condition falls back to (or below) the threshold, and the latches
-		// are independent (a single huge item with count = 1 is caught by the
-		// size trigger — the count trigger is blind to it). On a fire, the
-		// reminder is enqueued via pi's native steering (`deliverAs: "steer"`):
-		// it is persisted as a real user message at the next turn boundary and
-		// stays part of the session's messages — visible in every subsequent
-		// LLM call, and in compaction/summarization — until the pile is
-		// distilled. `sendUserMessage` is fire-and-forget (pi catches and
-		// surfaces errors internally).
+		// Steering reminder: the Fibonacci ladder on the eligible pending
+		// mass, observed at the turn boundary — after this turn's tool
+		// results are in (new pending marks and replacements recorded), so
+		// the snapshot is the freshest the boundary can see. Eligibility
+		// comes from the id set the last `context` event recorded: entries
+		// marked this turn are not yet in it (the model has not had a
+		// response to act on them), and entries compacted away have left
+		// it. When the mass crosses to a higher rung than already announced,
+		// ONE nag fires (even across several rungs at once) and the ratchet
+		// level catches up; when the mass falls below an announced rung,
+		// the level re-arms down. On a fire, the reminder is enqueued via
+		// pi's native steering (`deliverAs: "steer"`): it is persisted as a
+		// real user message at the next turn boundary and stays part of
+		// the session's messages — visible in every subsequent LLM call,
+		// and in compaction/summarization — until the pile is distilled.
+		// `sendUserMessage` is fire-and-forget (pi catches and surfaces
+		// errors internally).
 		const pending = pendingSummary(state);
-		const triggers = observePendingSteering(
-			steering,
-			pending.items.length,
-			pending.totalTokens,
-			{
-				countThreshold: config.steeringCountThreshold,
-				sizeThresholdTokens: config.steeringSizeThresholdTokens,
-				enabled: config.steeringReminder,
-			},
-		);
-		if (triggers.count || triggers.size) {
+		const decision = observePendingSteering(steering, pending.totalTokens, {
+			firstRungTokens: config.steeringFirstRungTokens,
+			enabled: config.steeringReminder,
+		});
+		if (decision.fire) {
 			api.sendUserMessage(
 				buildSteeringMessage(pending.items.length, pending.totalTokens, pending.items),
 				{ deliverAs: "steer" },

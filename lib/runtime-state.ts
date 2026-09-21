@@ -25,8 +25,30 @@ export function createRuntimeState(): ToolclipRuntimeState {
 		quarantines: new Map(),
 		releasedQuarantines: new Set(),
 		currentTurn: 0,
+		lastContextToolCallIds: new Set(),
 		readsThisRound: new Map(),
 	};
+}
+
+/**
+ * Record the tool-call ids present in the messages of the most recent
+ * `context` event, replacing any previous set. State only — the context
+ * handler stays a pure view transform and returns the same swapped
+ * messages. Steering eligibility is defined against this set (see
+ * `pendingSummary` in lib/steering.ts).
+ *
+ * @param state - The runtime state to mutate.
+ * @param ids - The toolCallIds of the toolResult messages in the context
+ *   event's messages, in message order.
+ */
+export function recordContextToolCallIds(
+	state: ToolclipRuntimeState,
+	ids: Iterable<string>,
+): void {
+	state.lastContextToolCallIds.clear();
+	for (const id of ids) {
+		state.lastContextToolCallIds.add(id);
+	}
 }
 
 /**
@@ -141,4 +163,5 @@ export function replacedIds(state: ToolclipRuntimeState): string[] {
  */
 export function clear(state: ToolclipRuntimeState): void {
 	state.entries.clear();
+	state.lastContextToolCallIds.clear();
 }
