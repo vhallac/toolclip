@@ -6,7 +6,66 @@ The LLM is the only actor. There is no auto-summarizer and no auto-eviction. The
 
 ## Status
 
-🚧 Bootstrap complete. Implementation per `.todo/task_plan.md` (12 units, cautious mode).
+> **⚠️ Abandoned (2026-09-23).** A controlled evaluation across six paired
+> agent sessions (3 raw, 3 toolclip-assisted — same task, same model, only
+> toolclip's compression varied) found the `replace_tool_result` compression
+> layer to be a net-neutral-to-negative bet on both cloud cost and
+> local-GPU latency, dominated by model strategy variance rather than the
+> mechanism itself. The `quarantine` sub-mechanism — automatic,
+> zero-decode-cost withholding of oversized results — is being extracted
+> into a focused standalone tool instead. Full evidence (six session logs +
+> checksums) is attached to the
+> [evaluation release](https://github.com/vhallac/toolclip/releases/tag/eval/toolclip-vs-raw/20260923).
+
+## Evaluation summary
+
+### Tokens & cost (3 raw vs. 3 toolclip-assisted, same task, same model)
+
+| | total tokens | total cost | avg cost/run |
+|---|---:|---:|---:|
+| Raw | 5,562,305 | $0.2739 | $0.0913 |
+| Toolclip | 8,280,742 | $0.5243 | $0.1748 |
+
+### Quality
+
+6 of 6 sessions (raw and toolclip alike) reached the same correct,
+independently-verified root cause — no measurable quality difference.
+
+### Where the cost actually came from
+
+Of 37 real `replace_tool_result` edits mined across the three toolclip
+sessions, 36 were free or net-positive. The one loss — a single edit in the
+most expensive session, ~$0.004 against a ~$0.0002 saving — combined with
+that session's own choice to run an elaborate live reproduction, accounts
+for most of the toolclip-side cost variance. Toolclip's cheapest run
+($0.025) beat every raw run outright.
+
+### Consumer-GPU extrapolation
+
+Modeling the same exploration path on local hardware (assumed 800 tok/s
+prefill, 20,000 tok/s cache-hit, 30 tok/s decode):
+
+| | wall-clock | peak KV-cache VRAM |
+|---|---:|---:|
+| Raw-equivalent (no compression) | ~1,048 s | ~13.2 GB |
+| Toolclip-assisted (actual) | ~1,215 s (16–40% slower) | ~6.0 GB |
+
+Toolclip trades decode time — the scarce resource on local hardware — for
+cache-read savings that are already cheap on both cloud and local setups:
+bad for latency, but a real, calculable win for VRAM headroom.
+
+### Conclusion
+
+`quarantine` is deterministic, costs no extra decode time (fixed
+boilerplate, not model-generated), and measurably changed agent behavior in
+~80% of incidents across 9 real sessions studied. `replace_tool_result`
+depends on model compliance (unreliable in practice — one session cleared
+only 2 of 26 pending markers), costs real decode time, and its benefit is
+often small. **Toolclip as a whole is abandoned in favor of a focused
+quarantine-only tool.**
+
+Full session logs and evidence:
+[evaluation release](https://github.com/vhallac/toolclip/releases/tag/eval/toolclip-vs-raw/20260923).
 
 ## What it does
 
